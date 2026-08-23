@@ -288,10 +288,43 @@ Three holes, and they are the load-bearing ones:
    Afrobeats is 36% tags and **0%** MuSe. Situational requests and non-Western
    music are where free data collapses, and they are not edge cases.
 
-So free data is a **cost reduction, not an architecture**: take valence and
-arousal from MuSe where it has them, take genre from Last.fm, and spend the LLM
-call only on what nobody else has — theme and stance, plus everything the free
-layers missed.
+### And then the quality check killed the MuSe half of it
+
+Coverage was the wrong thing to check first. On the 53 tracks that have both a
+MuSe row and one of our cards:
+
+    valence   r = +0.49
+    arousal   r = +0.45      (r is scale-invariant — this does not depend
+                              on how MuSe's ~1-9 range is rescaled to 0-10)
+
+About a quarter of the variance. That is far too loose to stand in for a card,
+and the disagreements are not noise — they are systematic, in the one direction
+that matters:
+
+| track | MuSe | ours | correct |
+|---|---|---|---|
+| Novacane — Frank Ocean | v 6.8 | v 2.0 | **ours** — dissociated and bleak |
+| Lay Me Down — Sam Smith | v 5.1 | v 1.0 | **ours** — a funeral song |
+| The Hills — The Weeknd | v 6.0 | v 2.0 | **ours** |
+| 2 On — Tinashe | v 2.8 | v 7.0 | **ours** — a party record |
+
+MuSe is derived from Last.fm tags, so it hears the sonic surface and the social
+context — *sexy*, *party*, *chill* — and not the words. That is exactly the
+*Changes* failure mode restated: a song that sounds one way and means another.
+Wiring it in would have made the product **worse and cheaper at the same time**.
+
+**Decision: MuSe is not a scorer.** It goes back to being what §2.3 said it was
+— a validation reference — and now it has a number attached: our cards and the
+best available tag-derived dataset agree at r≈0.49, which is itself the
+strongest evidence that lyric-reading buys something tags cannot.
+
+Last.fm genre tags stay where they already are, in candidate generation, which
+is the job they are good at.
+
+So free data reduces cost **only** in candidate generation. Scoring stays
+earned. The remaining cost levers are the honest ones: batch size (20/call
+today — larger batches cut calls proportionally), the 85% cross-request cache
+hit rate, and the bounded one-time pre-seed below.
 
 ### The bounded number
 
