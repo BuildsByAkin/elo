@@ -138,7 +138,7 @@ def sustain_cmd(con, title, artist, n, known_only, library_only, budget):
         if not cand:
             sys.exit("no candidates — neither source knows that song")
 
-    cand = [c for c in cand if c["id"] != seed["id"]]
+    cand = E.dedupe([c for c in cand if c["id"] != seed["id"]], common.norm)
     ranked = E.sustain(seed, cand, n, w_owned=P.OWNED_BONUS)
     owned = sum(1 for c in ranked if c.get("owned"))
     print("\nSTAYS IN THAT MOOD  (%d of %d candidates, %d yours)"
@@ -181,7 +181,7 @@ def shift_cmd(con, start, end, minutes, known_only, seed="", budget=60,
         sys.exit("no candidates — try --genre, or a --seed \"Title|Artist\"")
 
     print("\n%s -> %s over %d min" % (start, end, minutes))
-    return render_shift(pool, a, b, minutes)
+    return render_shift(E.dedupe(pool, common.norm), a, b, minutes)
 
 
 def render_shift(pool, a, b, minutes):
@@ -243,7 +243,7 @@ def make_cmd(con, text, n, known_only, budget, library_only):
     b = (spec["end"]["valence"], spec["end"]["energy"])
 
     if spec["mode"] == "shift":
-        return render_shift(cand, a, b, spec["minutes"])
+        return render_shift(E.dedupe(cand, common.norm), a, b, spec["minutes"])
 
     # Sustain needs something to hold. A named song is the best anchor because
     # its card is measured rather than imagined; without one, the spec itself
@@ -258,7 +258,7 @@ def make_cmd(con, text, n, known_only, budget, library_only):
                 "stance": spec.get("stance") or "",
                 "valence": a[0], "energy": a[1]}
 
-    cand = [c for c in cand if c["id"] != seed["id"]]
+    cand = E.dedupe([c for c in cand if c["id"] != seed["id"]], common.norm)
     ranked = E.sustain(seed, cand, n, w_owned=P.OWNED_BONUS)
     owned = sum(1 for c in ranked if c.get("owned"))
     print("\nSTAYS IN THAT MOOD  (%d of %d candidates, %d yours)"

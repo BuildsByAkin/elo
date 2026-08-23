@@ -102,6 +102,31 @@ def interpolate(a: Point, b: Point, steps: int) -> list[Point]:
              a[1] + (b[1] - a[1]) * i / (steps - 1)) for i in range(steps)]
 
 
+def dedupe(cards: Sequence[Card], key) -> list[Card]:
+    """Collapse different releases of the same recording.
+
+    `Beanie` and `Beanie (Slowed)` are separate rows with separate ids, so
+    deduping by id — which is all the selection loop does — happily serves both
+    in one playlist. Found by shipping: the first playlist pushed to YouTube
+    Music contained the same Chezile song at positions 2 and 8.
+
+    Where two rows collapse, the shorter title wins, which reliably prefers the
+    original over `(Slowed)`, `(Piano Version)` or `(Acoustic Version)`.
+    """
+    best: dict[tuple[str, str], Card] = {}
+    order: list[tuple[str, str]] = []
+    for c in cards:
+        k = (key(c.get("title") or ""), key(c.get("artist") or ""))
+        if not k[0]:
+            continue
+        if k not in best:
+            best[k] = c
+            order.append(k)
+        elif len(c.get("title") or "") < len(best[k].get("title") or ""):
+            best[k] = c
+    return [best[k] for k in order]
+
+
 def duration(cards: Iterable[Card], avg: int = AVG_SECONDS) -> int:
     return sum(int(c.get("seconds") or 0) or avg for c in cards)
 

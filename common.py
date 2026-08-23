@@ -91,13 +91,23 @@ _SUFFIX = re.compile(
 
 
 def norm(s):
-    """Aggressive normalisation for cross-source title/artist matching."""
+    """Aggressive normalisation for cross-source title/artist matching.
+
+    Keeps every script. The old version ended with `[^a-z0-9\\s]`, which
+    deleted anything that was not Latin: Cyrillic, Arabic and CJK titles all
+    normalised to the empty string, so they collided with each other, and
+    pool.ensure_tracks — which skips rows with an empty key — could never admit
+    them to the corpus at all. Non-Western music was being dropped by the
+    matcher rather than by any source. Accents are still folded, so `Café`
+    still matches `Cafe`, but `東京` now survives as `東京`.
+    """
     s = unicodedata.normalize("NFKD", s or "").lower()
     s = re.sub(r"\(.*?\)|\[.*?\]", " ", s)          # (feat. X), [Remix]
     s = re.sub(r"\b(feat|ft|featuring|with)\b.*", " ", s)
     s = s.replace("&", " and ").replace("+", " and ")
     s = _SUFFIX.sub(" ", s)
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))   # fold accents
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)            # keep letters
     return re.sub(r"\s+", " ", s).strip()
 
 

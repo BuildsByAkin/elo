@@ -195,6 +195,63 @@ class TestShift(unittest.TestCase):
         self.assertTrue(all(g == anchor for g in early), "got %s" % early)
 
 
+class TestDedupe(unittest.TestCase):
+    """The bug that reached a real YouTube Music playlist: the same Chezile
+    song at positions 2 and 8, as `Beanie (Slowed)` and `Beanie`."""
+
+    @staticmethod
+    def key(s):
+        from common import norm
+        return norm(s)
+
+    def test_collapses_versions_of_one_recording(self):
+        cards = [card(1, 2, 2, artist="Chezile"), card(2, 2, 2, artist="Chezile")]
+        cards[0]["title"], cards[1]["title"] = "Beanie (Slowed)", "Beanie"
+        out = E.dedupe(cards, self.key)
+        self.assertEqual(len(out), 1)
+
+    def test_prefers_the_shorter_original_title(self):
+        cards = [card(1, 2, 2, artist="Sia"), card(2, 2, 2, artist="Sia")]
+        cards[0]["title"] = "Elastic Heart (Piano Version)"
+        cards[1]["title"] = "Elastic Heart"
+        self.assertEqual(E.dedupe(cards, self.key)[0]["title"], "Elastic Heart")
+
+    def test_keeps_genuinely_different_songs(self):
+        cards = [card(1, 2, 2, artist="A"), card(2, 2, 2, artist="A")]
+        cards[0]["title"], cards[1]["title"] = "One", "Two"
+        self.assertEqual(len(E.dedupe(cards, self.key)), 2)
+
+    def test_same_title_different_artist_survives(self):
+        cards = [card(1, 2, 2, artist="Black Sabbath"),
+                 card(2, 2, 2, artist="Tupac")]
+        cards[0]["title"] = cards[1]["title"] = "Changes"
+        self.assertEqual(len(E.dedupe(cards, self.key)), 2)
+
+    def test_non_latin_titles_are_not_collapsed_together(self):
+        cards = [card(1, 2, 2, artist="Гио ПиКа"), card(2, 2, 2, artist="Гио ПиКа")]
+        cards[0]["title"], cards[1]["title"] = "Буйно голова", "Оправдан"
+        self.assertEqual(len(E.dedupe(cards, self.key)), 2)
+
+    def test_preserves_pool_order(self):
+        cards = [card(i, i, i, artist="A%d" % i) for i in range(5)]
+        self.assertEqual([c["id"] for c in E.dedupe(cards, self.key)],
+                         [0, 1, 2, 3, 4])
+
+    def test_shift_never_serves_the_same_recording_twice(self):
+        pool = []
+        for i in range(8):
+            a = card(i, float(i), float(i), artist="X%d" % i)
+            a["title"] = "Song%d" % i
+            pool.append(a)
+        twin = card(99, 3.0, 3.0, artist="X3")
+        twin["title"] = "Song3 (Slowed)"
+        pool.append(twin)
+        steps = E.shift(E.dedupe(pool, self.key), (0.0, 0.0), (7.0, 7.0), 40)
+        keys = [(self.key(s.card["title"]), self.key(s.card["artist"]))
+                for s in steps]
+        self.assertEqual(len(keys), len(set(keys)))
+
+
 class TestRampReport(unittest.TestCase):
     def test_detects_a_broken_ramp(self):
         steps = [E.Step(i, (0.0, 0.0), card(i, 0, e), 0.0)

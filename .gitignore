@@ -5,3 +5,6 @@ data/*.db
 data/*.backup
 .idea/
 .zencoder/
+browser.json
+oauth.json
+*.json.bak
