@@ -147,6 +147,7 @@ def sustain_cmd(con, title, artist, n, known_only, library_only, budget):
         show(c, "%d. " % i)
         print("     match %.2f%s" % (E.sustain_score(seed, c, w_owned=P.OWNED_BONUS),
                                      "   ● yours" if c.get("owned") else ""))
+    return ranked
 
 
 # -------------------------------------------------------------------- shift
@@ -180,7 +181,7 @@ def shift_cmd(con, start, end, minutes, known_only, seed="", budget=60,
         sys.exit("no candidates — try --genre, or a --seed \"Title|Artist\"")
 
     print("\n%s -> %s over %d min" % (start, end, minutes))
-    render_shift(pool, a, b, minutes)
+    return render_shift(pool, a, b, minutes)
 
 
 def render_shift(pool, a, b, minutes):
@@ -208,6 +209,7 @@ def render_shift(pool, a, b, minutes):
           % (100 * r["monotonic_frac"], r["max_jump"], r["mean_jump"]))
     print("(energy stands in for tempo — there is no BPM for this library, "
           "see DESIGN.md §2.4)")
+    return [s.card for s in steps]
 
 
 # --------------------------------------------------------------------- make
@@ -266,6 +268,7 @@ def make_cmd(con, text, n, known_only, budget, library_only):
         print("     match %.2f%s"
               % (E.sustain_score(seed, c, w_owned=P.OWNED_BONUS),
                  "   ● yours" if c.get("owned") else ""))
+    return ranked
 
 
 # ------------------------------------------------------------------- moods
@@ -296,6 +299,8 @@ def main():
                    help="select only from music you own (default: the corpus)")
     p.add_argument("--budget", type=int, default=60,
                    help="max uncached candidates to tag for this request")
+    p.add_argument("--push", metavar="NAME", default="",
+                   help="create this playlist on YouTube Music")
 
     p = sub.add_parser("shift", help="walk from one mood to another")
     p.add_argument("start")
@@ -310,6 +315,8 @@ def main():
                    help="select only from music you own")
     p.add_argument("--budget", type=int, default=60,
                    help="max uncached candidates to tag for this request")
+    p.add_argument("--push", metavar="NAME", default="",
+                   help="create this playlist on YouTube Music")
 
     p = sub.add_parser("similar", help="co-listening neighbours (no model)")
     p.add_argument("title")
@@ -330,6 +337,8 @@ def main():
     p.add_argument("-n", type=int, default=12)
     p.add_argument("--budget", type=int, default=60,
                    help="max uncached candidates to tag for this request")
+    p.add_argument("--push", metavar="NAME", default="",
+                   help="create this playlist on YouTube Music")
     p.add_argument("--library-only", action="store_true",
                    help="select only from music you own")
 
@@ -337,20 +346,26 @@ def main():
 
     a = ap.parse_args()
     con = common.connect()
+    picked = None
     if a.cmd == "sustain":
-        sustain_cmd(con, a.title, a.artist, a.n, a.known_only,
-                    a.library_only, a.budget)
+        picked = sustain_cmd(con, a.title, a.artist, a.n, a.known_only,
+                             a.library_only, a.budget)
     elif a.cmd == "shift":
-        shift_cmd(con, a.start, a.end, a.minutes, a.known_only, a.seed,
-                  a.budget, a.genres, a.library_only)
+        picked = shift_cmd(con, a.start, a.end, a.minutes, a.known_only,
+                           a.seed, a.budget, a.genres, a.library_only)
     elif a.cmd == "make":
-        make_cmd(con, a.request, a.n, a.known_only, a.budget, a.library_only)
+        picked = make_cmd(con, a.request, a.n, a.known_only, a.budget,
+                          a.library_only)
     elif a.cmd == "similar":
         import neighbours
         neighbours.run(con, a.title, a.artist, a.n, a.source, a.per, a.deep,
                        a.no_same_artist, a.mine)
     else:
         moods_cmd(con, a.known_only)
+
+    if getattr(a, "push", "") and picked:
+        import push
+        push.create(picked, a.push)
 
 
 if __name__ == "__main__":

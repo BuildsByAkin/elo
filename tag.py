@@ -21,7 +21,12 @@ import sys
 import common
 import lyrics as L
 
-BATCH = 20
+# Measured, not guessed: 20/40/60 all returned complete batches with zero
+# dropped cards on real tracks. 40 had the best per-track time (2.8s vs 3.3s at
+# 20) and halves the call count, which matters because the rubric and both
+# closed vocabularies — about 500 tokens — are re-sent on every call. 60 works
+# too but the prompt reaches 74k chars and the per-track time drifts back up.
+BATCH = 40
 LYRIC_CAP = 1600
 
 THEMES = [
