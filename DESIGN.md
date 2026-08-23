@@ -170,7 +170,84 @@ architecture for signals that do not exist.
 
 ---
 
-## 4. Architecture — the two designs are complementary, not competing
+## 4. What ships is a corpus, not a library
+
+**Correcting the central assumption, because it was wrong.** Everything above was
+written as though the 843-track library were the product. It is not. A new user
+installs this with zero tracks, and every selection path below returns nothing.
+`elo.py:51` — `WHERE t.external = 0` — is where that assumption lives, and it is
+load-bearing in `sustain`, `shift` and `moods` alike.
+
+The library has three legitimate jobs and *pool* is not among them:
+
+1. **Test fixture.** 843 real tracks that someone actually listens to, spanning
+   Afrobeats, drill, gospel and the Western canon — a far better validation set
+   than any published dataset, and the reason the Phase 0 measurements meant
+   anything. This is the job it is doing right now.
+2. **Seed rows of the shared corpus.** A mood card for *Changes — Black Sabbath*
+   is the same card for every user on earth. Cards are a property of the song,
+   not of the listener, so they are built once and reused forever. These 843 are
+   simply the first 843 rows.
+3. **An optional preference at request time** — "prefer things I own" as a scoring
+   bonus, never as the pool.
+
+### The request flow, with no library anywhere in it
+
+```
+  "sleepy to hyped, 30 min, r&b"
+        │
+        ▼  parse intent               1 LLM call
+  {mode: shift, start, end, minutes, genre_hints, seeds}
+        │
+        ▼  seed resolution            named seed, or genre+mood anchor
+        │
+        ▼  CANDIDATE GENERATION       no library, no model
+  YTM watch playlist ─┐
+  Last.fm getSimilar ─┼─ RRF ──►  ~200-400 candidates
+  2-hop expansion ────┘           (sources.py / neighbours.py — already built)
+        │
+        ▼  SCORING
+  look up cards in the corpus ──► hit:  free
+                              └─► miss: fetch lyrics + tag, batched, cached forever
+        │
+        ▼  SELECTION                  engine.shift / engine.sustain
+        │
+        ▼  push to YouTube Music
+```
+
+The user's library plugs in at exactly one optional point — a bonus in
+`sustain_score`, or a `--mine` filter. Remove it and the product still works.
+
+This is why `sources.py` mattered more than I credited it for. Co-listening is not
+a nice-to-have second opinion; **it is the only candidate source that works for a
+user with no library**, and it needs neither a key nor an account.
+
+### The cold-start problem, which is the real cost of being honest about this
+
+On-demand tagging is cheap per song and brutal on first contact. A request touching
+300 uncached candidates is ~15 batched LLM calls plus 300 lyric fetches — minutes,
+not seconds. It amortises to nothing, because the corpus is shared and popular music
+is requested repeatedly, but the first user through any unexplored corner of the
+catalogue pays for everyone.
+
+The fix is a build step, not a runtime one: **pre-seed the corpus offline** with a
+popularity-ranked set — Last.fm `chart.getTopTracks` and `tag.getTopTracks` across
+the mood and genre tags we care about, a few tens of thousands of tracks, tagged in
+bulk and shipped as a database. Runtime tagging then handles only the tail.
+
+That also makes the economics legible: the corpus is a fixed one-time cost that
+grows slowly, rather than a per-user cost that scales with the user base.
+
+⚠️ **This changes what `--known-only` and the 166-track hole mean.** In a library
+tool, an untaggable track is a hole in *your* music. In a corpus tool it is simply
+a track that never gets selected — there are always others. The lyric-coverage
+problem is much less severe at corpus scale than the Phase 0 numbers implied,
+because the corpus can afford to drop what it cannot read. It stops being a
+correctness problem and becomes a catalogue-bias problem: we will under-serve
+exactly the African and independent music §5 identified, and that bias is the thing
+to watch, not the raw coverage percentage.
+
+## 4b. Architecture — the two designs are complementary, not competing
 
 The working-tree simplification and the HEAD mood engine are solving different
 halves of the problem, which is why neither felt complete:
@@ -179,14 +256,17 @@ halves of the problem, which is why neither felt complete:
   CANDIDATE GENERATION            SCORING                  SELECTION
   "what songs could I play?"      "what is this song?"     "which, in what order?"
 
-  library (843 owned) ─────┐
-                           ├──►  mood card per track ──►  sustain: cluster sample
-  YTM radio ───┐           │     (lyrics → LLM)           shift:   path walk
-               ├─ RRF ─────┘     themes/stance/v/e        + constraints
-  Last.fm ─────┘  (sources.py)   (lyrics.py + tag.py)     (engine)
-   similar +                            ▲
-   genre tags                           │
-                              AudioFeaturesProvider (stubbed, blocked)
+  YTM radio ───┐                 mood card per song  ──►  sustain: cluster sample
+               ├─ RRF ─────────►  (lyrics → LLM)          shift:   path walk
+  Last.fm ─────┘  (sources.py)    themes/stance/v/e       + constraints
+   similar +                      cached in the corpus,   (engine.py)
+   genre tags                     built once, reused
+                                  by every user
+  your library ····┐                     ▲
+   (optional: a    ┊                     │
+    scoring bonus, ┊          AudioFeaturesProvider (stubbed, blocked)
+    never the pool)┊
+                   └····► preference only
 ```
 
 - **`sources.py` co-listening answers a question mood tags cannot**: what exists
@@ -250,10 +330,19 @@ Pure math over a list of dicts, no network — **unit tested**, per the brief.
 §2.4 is why there is none. Substituting a bounded `energy` delta, which is the same
 constraint in the axis we can actually measure. Flagging rather than faking it.
 
-**Phase 4 — `sources.py` becomes a real candidate generator.**
-Let shift mode pull in unowned tracks to fill gaps in the path, tag them on demand,
-mark them `external=1`. This is where the deleted `discover.py` comes back, and
-where co-listening earns its place in the mood product.
+**Phase 4 — cut the library out of the selection path. This is the one that makes
+it a product rather than my personal jukebox.**
+Promoted: until this lands, nothing here works for anyone who is not me. Drop the
+`WHERE t.external = 0` filter, build the pool from `neighbours.pool_for()` instead,
+tag uncached candidates on demand, and demote ownership to a scoring bonus. Then
+`elo.py shift sad hyped 30` works on a machine with an empty database, which is the
+only test of this that counts. `--mine` survives as an explicit opt-in.
+
+**Phase 4b — pre-seed the corpus.** Bulk-tag a popularity-ranked set (Last.fm
+`chart.getTopTracks` and `tag.getTopTracks` over the genre and mood tags we care
+about) so the first user through a given corner of the catalogue does not pay for
+everyone. Ship it as a database. This is where Last.fm genre tags — the thing §2.1
+found it is genuinely good at — do their real work.
 
 **Phase 5 — push to YouTube Music.** `create_playlist()` + fuzzy match + skip-with-
 warning. Small, and genuinely satisfying once Phase 3 output is worth listening to.
