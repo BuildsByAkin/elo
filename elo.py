@@ -119,29 +119,63 @@ def _tag_one(con, tid):
 
 # ------------------------------------------------------------------ sustain
 
-def sustain_cmd(con, title, artist, n, known_only):
+def sustain_cmd(con, title, artist, n, known_only, library_only, budget):
+    import pool as P
+
     seed = find_seed(con, title, artist)
     print("\nSEED")
     show(seed, "  ")
-    pool = [c for c in require_cards(con, known_only) if c["id"] != seed["id"]]
-    ranked = E.sustain(seed, pool, n)
-    print("\nSTAYS IN THAT MOOD  (%d of %d tagged tracks)" % (len(ranked),
-                                                              len(pool)))
+
+    if library_only:
+        cand = require_cards(con, known_only)
+    else:
+        # The pool is the corpus, not the library. With an empty database this
+        # still works: candidates come from co-listening and get tagged on the
+        # way through. See DESIGN.md §4.
+        cand = P.build(con, seed["title"], seed["artist"], budget=budget)
+        if known_only:
+            cand = [c for c in cand if c["confidence"] == "known"]
+        if not cand:
+            sys.exit("no candidates — neither source knows that song")
+
+    cand = [c for c in cand if c["id"] != seed["id"]]
+    ranked = E.sustain(seed, cand, n, w_owned=P.OWNED_BONUS)
+    owned = sum(1 for c in ranked if c.get("owned"))
+    print("\nSTAYS IN THAT MOOD  (%d of %d candidates, %d yours)"
+          % (len(ranked), len(cand), owned))
     for i, c in enumerate(ranked, 1):
         show(c, "%d. " % i)
-        print("     match %.2f" % E.sustain_score(seed, c))
+        print("     match %.2f%s" % (E.sustain_score(seed, c, w_owned=P.OWNED_BONUS),
+                                     "   ● yours" if c.get("owned") else ""))
 
 
 # -------------------------------------------------------------------- shift
 
-def shift_cmd(con, start, end, minutes, known_only):
+def shift_cmd(con, start, end, minutes, known_only, seed="", budget=60):
     """Walk from one named mood to another. The picking is engine.shift — pure,
     constrained and unit-tested; this function only resolves names and prints."""
+    import pool as P
+
     for m in (start, end):
         if m not in MOODS:
             sys.exit("unknown mood %r — try: %s" % (m, ", ".join(sorted(MOODS))))
     a, b = MOODS[start], MOODS[end]
-    pool = require_cards(con, known_only)
+
+    if seed:
+        # A seed makes shift library-free: candidates come from co-listening
+        # around that song, so an empty database still produces a playlist.
+        title, _, artist = seed.partition("|")
+        pool = P.build(con, title.strip(), artist.strip(), budget=budget)
+        if known_only:
+            pool = [c for c in pool if c["confidence"] == "known"]
+        if not pool:
+            sys.exit("no candidates — neither source knows that seed")
+    else:
+        pool = require_cards(con, known_only)
+        print("no --seed given, so this is selecting over your library only.",
+              file=sys.stderr)
+        print("pass --seed \"Title|Artist\" to build a pool from the corpus.",
+              file=sys.stderr)
 
     print("\n%s -> %s over %d min" % (start, end, minutes))
     print("  from valence %.1f energy %.1f  to  valence %.1f energy %.1f"
@@ -192,11 +226,20 @@ def main():
     p.add_argument("title")
     p.add_argument("artist", nargs="?", default="")
     p.add_argument("-n", type=int, default=10)
+    p.add_argument("--library-only", action="store_true",
+                   help="select only from music you own (default: the corpus)")
+    p.add_argument("--budget", type=int, default=60,
+                   help="max uncached candidates to tag for this request")
 
     p = sub.add_parser("shift", help="walk from one mood to another")
     p.add_argument("start")
     p.add_argument("end")
     p.add_argument("minutes", type=int)
+    p.add_argument("--seed", default="",
+                   help='"Title|Artist" — builds the pool from the corpus '
+                        "instead of your library")
+    p.add_argument("--budget", type=int, default=60,
+                   help="max uncached candidates to tag for this request")
 
     p = sub.add_parser("similar", help="co-listening neighbours (no model)")
     p.add_argument("title")
@@ -217,9 +260,11 @@ def main():
     a = ap.parse_args()
     con = common.connect()
     if a.cmd == "sustain":
-        sustain_cmd(con, a.title, a.artist, a.n, a.known_only)
+        sustain_cmd(con, a.title, a.artist, a.n, a.known_only,
+                    a.library_only, a.budget)
     elif a.cmd == "shift":
-        shift_cmd(con, a.start, a.end, a.minutes, a.known_only)
+        shift_cmd(con, a.start, a.end, a.minutes, a.known_only, a.seed,
+                  a.budget)
     elif a.cmd == "similar":
         import neighbours
         neighbours.run(con, a.title, a.artist, a.n, a.source, a.per, a.deep,

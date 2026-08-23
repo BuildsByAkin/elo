@@ -122,16 +122,23 @@ def theme_overlap(a: Card, b: Card) -> float:
 def sustain_score(seed: Card, c: Card,
                   w_theme: float = 6.0,
                   w_stance: float = 1.5,
-                  w_distance: float = 4.0) -> float:
+                  w_distance: float = 4.0,
+                  w_owned: float = 0.0) -> float:
     """Shared subject dominates; stance breaks ties; mood-space nearness sorts
     the rest.
 
     The weights are reasoned, not tuned (DESIGN.md §6). Exposed as arguments
     precisely so they can be tuned once there is a test set to tune against.
+
+    `w_owned` is the ownership preference. It defaults to 0.0 because owning a
+    song must never be required to be selected — a new user owns nothing and
+    must still get a good playlist. Turn it up to break close calls toward the
+    listener's own music.
     """
     return (w_theme * theme_overlap(seed, c)
             + (w_stance if seed.get("stance") == c.get("stance") else 0.0)
-            - w_distance * distance(point_of(seed), point_of(c)) / SPAN)
+            - w_distance * distance(point_of(seed), point_of(c)) / SPAN
+            + (w_owned if c.get("owned") else 0.0))
 
 
 def sustain(seed: Card, pool: Sequence[Card], n: int = 10,

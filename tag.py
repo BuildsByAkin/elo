@@ -98,6 +98,43 @@ def block(t, lyric):
     return head + ("\nLYRICS:\n" + lyric if lyric else "\n(no lyrics found)")
 
 
+REQUIRED = ("id", "themes", "stance", "valence", "energy", "summary",
+            "confidence")
+
+
+def usable(c, by_id):
+    """Is this card safe to store?
+
+    The CLI backend has no server-side schema enforcement (common.py) — the
+    schema is stated in the prompt and the model can quietly omit a field. One
+    card missing `valence` should cost that one card, not the remaining 38
+    batches, so validate here and drop what does not survive. Cards are
+    re-requested on the next run.
+    """
+    if not isinstance(c, dict) or c.get("id") not in by_id:
+        return False
+    if any(k not in c for k in REQUIRED):
+        return False
+    try:
+        c["valence"] = min(10.0, max(0.0, float(c["valence"])))
+        c["energy"] = min(10.0, max(0.0, float(c["energy"])))
+    except (TypeError, ValueError):
+        return False
+    themes = c.get("themes")
+    if isinstance(themes, str):
+        themes = [themes]
+    themes = [t for t in (themes or []) if t in THEMES][:3]
+    if not themes:
+        return False
+    c["themes"] = themes
+    if c.get("stance") not in STANCES:
+        return False
+    if c.get("confidence") not in ("known", "guessed"):
+        c["confidence"] = "guessed"
+    c["summary"] = str(c.get("summary") or "")
+    return True
+
+
 def save(con, cards):
     con.executemany(
         "INSERT OR REPLACE INTO moods (track_id, themes, stance, valence,"
@@ -110,6 +147,19 @@ def run(con, retag=False, limit=0):
     if not tracks:
         print("everything is already tagged — use --retag to rebuild")
         return
+    tag_tracks(con, tracks)
+    summarise(con)
+
+
+def tag_tracks(con, tracks):
+    """Tag an explicit list of tracks, owned or not.
+
+    Split out from run() because the corpus needs it: candidates arriving from
+    co-listening are external=1 and load() deliberately does not see them, but
+    they need exactly the same card. See DESIGN.md §4.
+    """
+    if not tracks:
+        return 0
     lyr = L.load(con, [t["id"] for t in tracks])
     have = sum(1 for v in lyr.values() if v[0] != "none")
     print("tagging %d tracks in %d calls (%d have lyrics)"
@@ -134,7 +184,7 @@ def run(con, retag=False, limit=0):
                   file=sys.stderr)
             continue
         by_id = {t["id"]: t for t in batch}
-        cards = [c for c in out.get("cards", []) if c.get("id") in by_id]
+        cards = [c for c in out.get("cards", []) if usable(c, by_id)]
         save(con, [(c["id"], json.dumps(c["themes"]), c["stance"],
                     c["valence"], c["energy"], c["summary"],
                     "lyrics" if texts.get(c["id"]) else "metadata",
@@ -158,7 +208,7 @@ def run(con, retag=False, limit=0):
             print("  batch %d: %s" % (n, err), file=sys.stderr)
         print("re-run `python tag.py` to retry only what is missing",
               file=sys.stderr)
-    summarise(con)
+    return done
 
 
 def summarise(con):
