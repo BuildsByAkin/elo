@@ -24,6 +24,7 @@ import math
 import sys
 
 import common
+import engine as E
 import lyrics as L
 import tag as T
 
@@ -36,8 +37,7 @@ MOODS = {
     "focus": (5.0, 4.0), "romantic": (6.5, 3.5), "chill": (6.0, 3.0),
     "content": (7.0, 4.0), "happy": (8.0, 6.0), "hyped": (8.5, 9.0),
 }
-SPAN = math.hypot(10, 10)      # longest possible distance in mood space
-AVG_SECONDS = 210              # fallback when an export carries no duration
+# SPAN and AVG_SECONDS now live in engine.py, with the rest of the math.
 
 CARD_COLS = ("id", "title", "artist", "genre", "seconds", "themes", "stance",
              "valence", "energy", "summary", "confidence", "basis")
@@ -119,74 +119,53 @@ def _tag_one(con, tid):
 
 # ------------------------------------------------------------------ sustain
 
-def score(seed, c):
-    """Shared subject dominates; nearness in mood space breaks the ties.
-
-    The weights are reasoned, not tuned — see DESIGN.md §6. They stay guesses
-    until there is a test set to tune them against."""
-    a, b = set(seed["themes"]), set(c["themes"])
-    overlap = len(a & b) / len(a | b) if (a | b) else 0.0
-    dist = math.hypot(seed["valence"] - c["valence"],
-                      seed["energy"] - c["energy"]) / SPAN
-    return 6.0 * overlap + (1.5 if seed["stance"] == c["stance"] else 0.0) \
-        - 4.0 * dist
-
-
 def sustain_cmd(con, title, artist, n, known_only):
     seed = find_seed(con, title, artist)
     print("\nSEED")
     show(seed, "  ")
     pool = [c for c in require_cards(con, known_only) if c["id"] != seed["id"]]
-    ranked = sorted(pool, key=lambda c: -score(seed, c))[:n]
+    ranked = E.sustain(seed, pool, n)
     print("\nSTAYS IN THAT MOOD  (%d of %d tagged tracks)" % (len(ranked),
                                                               len(pool)))
     for i, c in enumerate(ranked, 1):
         show(c, "%d. " % i)
-        print("     match %.2f" % score(seed, c))
+        print("     match %.2f" % E.sustain_score(seed, c))
 
 
 # -------------------------------------------------------------------- shift
 
 def shift_cmd(con, start, end, minutes, known_only):
-    """Phase 1 behaviour: straight-line interpolation, nearest untaken track.
-
-    This is deliberately still the naive version. Phase 3 replaces the picker
-    with a real constraint set — no artist twice in a window, bounded per-step
-    energy delta, genre coherence early — which is where shift mode becomes the
-    product rather than a demo. See DESIGN.md §5.
-    """
+    """Walk from one named mood to another. The picking is engine.shift — pure,
+    constrained and unit-tested; this function only resolves names and prints."""
     for m in (start, end):
         if m not in MOODS:
             sys.exit("unknown mood %r — try: %s" % (m, ", ".join(sorted(MOODS))))
     a, b = MOODS[start], MOODS[end]
     pool = require_cards(con, known_only)
 
-    budget = minutes * 60
-    steps = max(2, round(budget / AVG_SECONDS))
-    print("\n%s -> %s over %d min (~%d tracks)" % (start, end, minutes, steps))
+    print("\n%s -> %s over %d min" % (start, end, minutes))
     print("  from valence %.1f energy %.1f  to  valence %.1f energy %.1f"
           % (a + b))
 
-    used, total, taken = [], 0, set()
-    for i in range(steps):
-        f = i / (steps - 1)
-        tv = a[0] + (b[0] - a[0]) * f
-        te = a[1] + (b[1] - a[1]) * f
-        left = [c for c in pool if c["id"] not in taken]
-        if not left:
-            break
-        pick = min(left, key=lambda c: math.hypot(c["valence"] - tv,
-                                                  c["energy"] - te))
-        used.append(pick)
-        taken.add(pick["id"])
-        total += pick["seconds"] or AVG_SECONDS
-        if total >= budget:
-            break
+    steps = E.shift(pool, a, b, minutes)
+    if not steps:
+        sys.exit("nothing to pick from")
+    total = E.duration([s.card for s in steps])
 
     print("\nSHIFT  (%d tracks, %d min %02d sec)"
-          % (len(used), total // 60, total % 60))
-    for i, c in enumerate(used, 1):
-        show(c, "%d. " % i)
+          % (len(steps), total // 60, total % 60))
+    for s in steps:
+        show(s.card, "%d. " % (s.index + 1))
+        print("     target v%.1f e%.1f%s"
+              % (s.target[0], s.target[1],
+                 "   ! " + "; ".join(s.broke) if s.broke else ""))
+
+    r = E.ramp_report(steps)
+    print("\nramp: %.0f%% of steps move toward the destination; "
+          "biggest energy jump %.1f, mean %.1f"
+          % (100 * r["monotonic_frac"], r["max_jump"], r["mean_jump"]))
+    print("(energy stands in for tempo — there is no BPM for this library, "
+          "see DESIGN.md §2.4)")
 
 
 # ------------------------------------------------------------------- moods
