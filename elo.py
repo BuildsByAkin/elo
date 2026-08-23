@@ -180,6 +180,12 @@ def shift_cmd(con, start, end, minutes, known_only, seed="", budget=60,
         sys.exit("no candidates — try --genre, or a --seed \"Title|Artist\"")
 
     print("\n%s -> %s over %d min" % (start, end, minutes))
+    render_shift(pool, a, b, minutes)
+
+
+def render_shift(pool, a, b, minutes):
+    """Run and print a shift. Shared by `shift` (named anchors) and `make`
+    (coordinates parsed from natural language)."""
     print("  from valence %.1f energy %.1f  to  valence %.1f energy %.1f"
           % (a + b))
 
@@ -202,6 +208,64 @@ def shift_cmd(con, start, end, minutes, known_only, seed="", budget=60,
           % (100 * r["monotonic_frac"], r["max_jump"], r["mean_jump"]))
     print("(energy stands in for tempo — there is no BPM for this library, "
           "see DESIGN.md §2.4)")
+
+
+# --------------------------------------------------------------------- make
+
+def make_cmd(con, text, n, known_only, budget, library_only):
+    """Natural language to playlist. The command the product actually ships."""
+    import intent
+    import pool as P
+
+    spec = intent.parse(text)
+    print("\n%s" % intent.describe(spec))
+    print("  %s\n" % spec.get("reason", ""))
+
+    seed_title = spec.get("seed_title") or ""
+    seed_artist = spec.get("seed_artist") or ""
+
+    if library_only:
+        cand = require_cards(con, known_only)
+    elif seed_title:
+        cand = P.build(con, seed_title, seed_artist, budget=budget,
+                       include_library=True)
+    else:
+        cand = P.discover(con, spec.get("genres") or [], budget=budget,
+                          include_library=True)
+    if known_only:
+        cand = [c for c in cand if c["confidence"] == "known"]
+    if not cand:
+        sys.exit("no candidates for that request")
+
+    a = (spec["start"]["valence"], spec["start"]["energy"])
+    b = (spec["end"]["valence"], spec["end"]["energy"])
+
+    if spec["mode"] == "shift":
+        return render_shift(cand, a, b, spec["minutes"])
+
+    # Sustain needs something to hold. A named song is the best anchor because
+    # its card is measured rather than imagined; without one, the spec itself
+    # describes the point to sit on, so build a card-shaped target from it.
+    if seed_title:
+        seed = find_seed(con, seed_title, seed_artist)
+        print("SEED")
+        show(seed, "  ")
+    else:
+        seed = {"id": -1, "title": "(your request)", "artist": "",
+                "themes": spec.get("themes") or [],
+                "stance": spec.get("stance") or "",
+                "valence": a[0], "energy": a[1]}
+
+    cand = [c for c in cand if c["id"] != seed["id"]]
+    ranked = E.sustain(seed, cand, n, w_owned=P.OWNED_BONUS)
+    owned = sum(1 for c in ranked if c.get("owned"))
+    print("\nSTAYS IN THAT MOOD  (%d of %d candidates, %d yours)"
+          % (len(ranked), len(cand), owned))
+    for i, c in enumerate(ranked, 1):
+        show(c, "%d. " % i)
+        print("     match %.2f%s"
+              % (E.sustain_score(seed, c, w_owned=P.OWNED_BONUS),
+                 "   ● yours" if c.get("owned") else ""))
 
 
 # ------------------------------------------------------------------- moods
@@ -261,6 +325,14 @@ def main():
     p.add_argument("--mine", action="store_true",
                    help="only tracks already in your library")
 
+    p = sub.add_parser("make", help="plain English in, playlist out")
+    p.add_argument("request", help='e.g. "I just got dumped and want to wallow"')
+    p.add_argument("-n", type=int, default=12)
+    p.add_argument("--budget", type=int, default=60,
+                   help="max uncached candidates to tag for this request")
+    p.add_argument("--library-only", action="store_true",
+                   help="select only from music you own")
+
     sub.add_parser("moods", help="the named moods and your coverage of them")
 
     a = ap.parse_args()
@@ -271,6 +343,8 @@ def main():
     elif a.cmd == "shift":
         shift_cmd(con, a.start, a.end, a.minutes, a.known_only, a.seed,
                   a.budget, a.genres, a.library_only)
+    elif a.cmd == "make":
+        make_cmd(con, a.request, a.n, a.known_only, a.budget, a.library_only)
     elif a.cmd == "similar":
         import neighbours
         neighbours.run(con, a.title, a.artist, a.n, a.source, a.per, a.deep,
