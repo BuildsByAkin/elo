@@ -64,9 +64,15 @@ CREATE INDEX IF NOT EXISTS moods_ve ON moods (valence, energy);
 
 
 def connect(create=False):
-    if not create and not os.path.exists(DB):
-        sys.exit("No library at %s — run: python ingest.py ~/Desktop/library.txt"
-                 % DB)
+    """Open the corpus, creating it if this is a first run.
+
+    This used to refuse to start without an ingested library, which was the
+    library-first assumption in its purest form: a new user has no library and
+    is not going to make one. The corpus fills itself from co-listening as
+    requests come in, so an empty database is a normal starting state, not an
+    error. `create` is kept for callers that pass it and no longer gates
+    anything.
+    """
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     con = sqlite3.connect(DB)
     con.executescript(SCHEMA)

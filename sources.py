@@ -125,6 +125,40 @@ def lastfm(title, artist, limit=100):
     return out
 
 
+def tag_top(tag, limit=50):
+    """Top tracks for a Last.fm tag — this is the job tags are actually good at.
+
+    DESIGN.md §2.1 killed Last.fm as a *mood* signal: 8% track-tag coverage on
+    a real library, and the tag mass sits on genre, decade and artist identity
+    rather than emotion. That same concentration is why it is a good *genre*
+    candidate source. Ask it for "r&b", not for "melancholy" — it supplies the
+    pool, our cards supply the mood.
+    """
+    j = fm("tag.getTopTracks", tag=tag, limit=limit)
+    out = []
+    for t in (j.get("tracks", {}).get("track") or []):
+        name, who = t.get("name"), (t.get("artist") or {}).get("name")
+        if name and who:
+            out.append({"title": name, "artist": who, "rank": len(out) + 1,
+                        "score": None, "source": "lastfm-tag:%s" % tag,
+                        "length": "", "album": "", "videoId": ""})
+    return out
+
+
+def chart_top(limit=50):
+    """Globally popular tracks — the seedless fallback when the request carries
+    no genre hint at all."""
+    j = fm("chart.getTopTracks", limit=limit)
+    out = []
+    for t in (j.get("tracks", {}).get("track") or []):
+        name, who = t.get("name"), (t.get("artist") or {}).get("name")
+        if name and who:
+            out.append({"title": name, "artist": who, "rank": len(out) + 1,
+                        "score": None, "source": "lastfm-chart",
+                        "length": "", "album": "", "videoId": ""})
+    return out
+
+
 def fuse(groups, k=60):
     """Reciprocal rank fusion.
 

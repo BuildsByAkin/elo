@@ -151,7 +151,8 @@ def sustain_cmd(con, title, artist, n, known_only, library_only, budget):
 
 # -------------------------------------------------------------------- shift
 
-def shift_cmd(con, start, end, minutes, known_only, seed="", budget=60):
+def shift_cmd(con, start, end, minutes, known_only, seed="", budget=60,
+              genres=(), library_only=False):
     """Walk from one named mood to another. The picking is engine.shift — pure,
     constrained and unit-tested; this function only resolves names and prints."""
     import pool as P
@@ -161,21 +162,22 @@ def shift_cmd(con, start, end, minutes, known_only, seed="", budget=60):
             sys.exit("unknown mood %r — try: %s" % (m, ", ".join(sorted(MOODS))))
     a, b = MOODS[start], MOODS[end]
 
-    if seed:
-        # A seed makes shift library-free: candidates come from co-listening
-        # around that song, so an empty database still produces a playlist.
-        title, _, artist = seed.partition("|")
-        pool = P.build(con, title.strip(), artist.strip(), budget=budget)
-        if known_only:
-            pool = [c for c in pool if c["confidence"] == "known"]
-        if not pool:
-            sys.exit("no candidates — neither source knows that seed")
-    else:
+    if library_only:
         pool = require_cards(con, known_only)
-        print("no --seed given, so this is selecting over your library only.",
-              file=sys.stderr)
-        print("pass --seed \"Title|Artist\" to build a pool from the corpus.",
-              file=sys.stderr)
+    elif seed:
+        # Candidates from co-listening around a named song.
+        title, _, artist = seed.partition("|")
+        pool = P.build(con, title.strip(), artist.strip(), budget=budget,
+                       include_library=True)
+    else:
+        # No seed and no library: genre hints (or the global chart) supply the
+        # pool. This is the path a brand-new user takes, so it must not depend
+        # on owning anything. See DESIGN.md §4.
+        pool = P.discover(con, genres, budget=budget, include_library=True)
+    if known_only:
+        pool = [c for c in pool if c["confidence"] == "known"]
+    if not pool:
+        sys.exit("no candidates — try --genre, or a --seed \"Title|Artist\"")
 
     print("\n%s -> %s over %d min" % (start, end, minutes))
     print("  from valence %.1f energy %.1f  to  valence %.1f energy %.1f"
@@ -236,8 +238,12 @@ def main():
     p.add_argument("end")
     p.add_argument("minutes", type=int)
     p.add_argument("--seed", default="",
-                   help='"Title|Artist" — builds the pool from the corpus '
-                        "instead of your library")
+                   help='"Title|Artist" — build the pool around this song')
+    p.add_argument("--genre", action="append", default=[], dest="genres",
+                   help="genre hint, repeatable (e.g. --genre r&b). With no "
+                        "seed and no genre, falls back to the global chart")
+    p.add_argument("--library-only", action="store_true",
+                   help="select only from music you own")
     p.add_argument("--budget", type=int, default=60,
                    help="max uncached candidates to tag for this request")
 
@@ -264,7 +270,7 @@ def main():
                     a.library_only, a.budget)
     elif a.cmd == "shift":
         shift_cmd(con, a.start, a.end, a.minutes, a.known_only, a.seed,
-                  a.budget)
+                  a.budget, a.genres, a.library_only)
     elif a.cmd == "similar":
         import neighbours
         neighbours.run(con, a.title, a.artist, a.n, a.source, a.per, a.deep,

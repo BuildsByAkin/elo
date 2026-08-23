@@ -20,6 +20,7 @@ import sys
 import common
 import lyrics as L
 import neighbours
+import sources as S
 import tag as T
 
 # What owning a track is worth when ranking. Small on purpose: a song you own
@@ -139,6 +140,61 @@ def cards_for(con, ids):
         c["owned"] = not c["external"]
         out.append(c)
     return out
+
+
+def discover(con, genre_hints=(), per=50, expand=3, budget=60,
+             include_library=False, quiet=False):
+    """A pool with no seed track and no library — what a new user's first
+    request has to work from.
+
+    Genre hints go to Last.fm `tag.getTopTracks`, which is the one job §2.1
+    found tags are genuinely good at. With no hint at all we fall back to the
+    global chart. Either way the result is only a *pool*: the mood judgement is
+    entirely ours, from the cards.
+
+    `expand` then walks co-listening out from the top few, because a genre's
+    top tracks cluster in popularity and a shift needs tracks spread along the
+    whole path, not fifty songs sitting at the same point in mood space.
+    """
+    groups, used = [], []
+    for hint in genre_hints:
+        got = S.tag_top(hint, per)
+        if got:
+            groups.append(got)
+            used.append("tag:%s (%d)" % (hint, len(got)))
+    if not groups:
+        got = S.chart_top(per)
+        if got:
+            groups.append(got)
+            used.append("global chart (%d)" % len(got))
+    if not groups:
+        return []
+    cands = S.fuse(groups)
+    if not quiet:
+        print("  %d seed candidates from %s" % (len(cands), ", ".join(used)),
+              file=sys.stderr)
+
+    if expand:
+        extra = []
+        for c in cands[:expand]:
+            got, _ = neighbours.pool_for(c["title"], c["artist"], "both", per)
+            extra.extend(got)
+        if extra:
+            cands = S.fuse([cands, extra])
+            if not quiet:
+                print("  %d after co-listening expansion" % len(cands),
+                      file=sys.stderr)
+
+    ids, new = ensure_tracks(con, cands)
+    if new and not quiet:
+        print("  %d new to the corpus" % new, file=sys.stderr)
+    ensure_cards(con, ids, budget=budget, quiet=quiet)
+
+    if include_library:
+        ids += [r[0] for r in con.execute(
+            "SELECT track_id FROM moods m JOIN tracks t ON t.id=m.track_id"
+            " WHERE t.external=0")]
+    return cards_for(con, sorted(set(ids)))
 
 
 def build(con, seed_title, seed_artist="", per=50, deep=False, budget=60,
