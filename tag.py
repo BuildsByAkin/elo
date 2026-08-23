@@ -115,25 +115,49 @@ def run(con, retag=False, limit=0):
     print("tagging %d tracks in %d calls (%d have lyrics)"
           % (len(tracks), -(-len(tracks) // BATCH), have), file=sys.stderr)
 
-    done = 0
+    done, failed, missing = 0, [], 0
     for i in range(0, len(tracks), BATCH):
         batch = tracks[i:i + BATCH]
         texts = {t["id"]: (lyr.get(t["id"], ("none", ""))[1] or "")[:LYRIC_CAP]
                  for t in batch}
-        out = common.llm(
-            RUBRIC + "\n\nTHEMES: " + ", ".join(THEMES) +
-            "\nSTANCES: " + ", ".join(STANCES) + "\n\n" +
-            "\n\n".join(block(t, texts[t["id"]]) for t in batch), SCHEMA)
+        # One bad batch must not cost the other 42. Cards are committed per
+        # batch, and a re-run skips whatever already landed, so the cheapest
+        # recovery is to note the failure and keep going.
+        try:
+            out = common.llm(
+                RUBRIC + "\n\nTHEMES: " + ", ".join(THEMES) +
+                "\nSTANCES: " + ", ".join(STANCES) + "\n\n" +
+                "\n\n".join(block(t, texts[t["id"]]) for t in batch), SCHEMA)
+        except Exception as e:
+            failed.append((i // BATCH + 1, str(e)[:160]))
+            print("  batch %d FAILED: %s" % (i // BATCH + 1, str(e)[:160]),
+                  file=sys.stderr)
+            continue
         by_id = {t["id"]: t for t in batch}
+        cards = [c for c in out.get("cards", []) if c.get("id") in by_id]
         save(con, [(c["id"], json.dumps(c["themes"]), c["stance"],
                     c["valence"], c["energy"], c["summary"],
                     "lyrics" if texts.get(c["id"]) else "metadata",
-                    c["confidence"])
-                   for c in out["cards"] if c["id"] in by_id])
-        done += len(out["cards"])
-        print("  %d/%d" % (min(i + BATCH, len(tracks)), len(tracks)),
+                    c["confidence"]) for c in cards])
+        done += len(cards)
+        # The rubric says one card per track; if the model drops one, say so
+        # rather than letting the count quietly disagree with the library.
+        gap = len(batch) - len({c["id"] for c in cards})
+        missing += gap
+        print("  %d/%d%s" % (min(i + BATCH, len(tracks)), len(tracks),
+                             "   (%d track(s) got no card)" % gap if gap else ""),
               file=sys.stderr)
+
     print("wrote %d cards" % done, file=sys.stderr)
+    if missing:
+        print("%d track(s) came back without a card — re-run to fill them"
+              % missing, file=sys.stderr)
+    if failed:
+        print("%d batch(es) failed:" % len(failed), file=sys.stderr)
+        for n, err in failed:
+            print("  batch %d: %s" % (n, err), file=sys.stderr)
+        print("re-run `python tag.py` to retry only what is missing",
+              file=sys.stderr)
     summarise(con)
 
 

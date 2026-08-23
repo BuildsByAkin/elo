@@ -260,16 +260,42 @@ warning. Small, and genuinely satisfying once Phase 3 output is worth listening 
 
 **Phase 6 — audio, aimed at the hole rather than at everything.**
 Interface stubbed from Phase 3. When audio becomes feasible (iTunes 30-second
-previews → Essentia), **do not run it over the library.** Run it over the ~170
-lyric-less tracks — the instrumentals, the lyric-less Afrobeats, the gospel — which
-are the only tracks with no real signal at all today, carrying title-inference cards
-marked `guessed`.
+previews → Essentia), **do not run it over the library.** Run it over the
+lyric-less tracks, which are the only ones with no real signal today. `basis`
+records exactly which they are, so the target set is a `WHERE` clause.
 
-This changes the economics of the phase entirely. "Analyse 843 songs" is a project
-with a rate-limit problem; "patch 170 cards" is an afternoon where preview rate
-limits stop mattering. Audio is worth the least where lyrics already work and the
-most where they returned nothing, so it should be pointed only at the second group.
-`basis` already records which tracks those are, so the target set is a `WHERE` clause.
+This changes the economics entirely: "analyse 843 songs" is a project with a
+rate-limit problem, "patch 166 cards" is an afternoon where preview rate limits
+stop mattering.
+
+**Measured, and it corrects the assumption above.** The hole is 166 tracks, and
+they are *not* instrumentals — they are vocal tracks the lyric databases simply do
+not carry:
+
+| genre | missing | share of that genre |
+|---|---|---|
+| Hip-Hop/Rap | 44 | 21% |
+| Christian (largely Nigerian/Yoruba gospel) | 16 | **62%** |
+| Afro-Beat | 15 | **41%** |
+| Worldwide | 11 | 23% |
+
+Independent rap (`Not a Single Tear` — BabyxMattie), Yoruba gospel (`Ìpín` — Sola
+Allyson), Afrobeats (`E Jon` — Son of Ika). These have lyrics; LRCLIB and Genius
+have never indexed them. It is a **catalogue-coverage hole, not an acoustic one**,
+and it falls on exactly the music the earlier probe found the model cannot read
+from metadata either — the same 4% band. The two blind spots are the same blind spot.
+
+⚠️ **So audio is a partial patch, and it is worth being precise about which part.**
+Essentia returns valence and arousal from sound. It cannot return *what a song is
+about*. For these 166 that leaves `valence`/`energy` fixed and `themes` still
+guessed — and `themes` is the dominant term in `sustain_score` at weight 6.0 against
+4.0 for the whole mood-space distance. Audio would repair the axis that breaks ties
+and leave the axis that does the ranking untouched.
+
+Which means the real fix for these 166 is a lyric source that covers African and
+independent catalogue, not a spectrogram. Worth pricing Musixmatch's paid tier
+against them specifically before assuming Essentia closes this. Audio is still
+worth doing — it just buys less here than the phase title implies.
 
 Commit per phase.
 
