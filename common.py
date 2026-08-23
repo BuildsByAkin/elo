@@ -7,6 +7,9 @@ import sys
 import unicodedata
 import time
 
+import shutil
+import subprocess
+
 import requests
 
 def _load_env():
@@ -23,7 +26,8 @@ def _load_env():
 
 _load_env()
 
-MODEL = os.environ.get("ELO_MODEL", "claude-sonnet-5")
+CLI_MODEL = os.environ.get("ELO_MODEL", "sonnet")
+API_MODEL = os.environ.get("ELO_API_MODEL", "claude-sonnet-5")
 DB = os.environ.get("ELO_DB") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data", "elo.db")
 
@@ -91,16 +95,49 @@ def norm(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def llm(prompt, schema, max_tokens=16000, retries=3):
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        sys.exit("ANTHROPIC_API_KEY is not set. export it and re-run.")
+def _extract(text):
+    """The CLI returns prose-free JSON when asked, but tolerate a code fence."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-z]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t.strip())
+    start = min([i for i in (t.find("{"), t.find("[")) if i != -1] or [0])
+    return json.loads(t[start:])
+
+
+def _via_cli(prompt, schema, retries=2):
+    """Use the logged-in Claude Code CLI. No separate API key, no separate bill.
+
+    The CLI has no server-side schema enforcement, so the schema is stated in
+    the prompt and the reply is parsed here; a parse failure is retried once
+    with the error fed back."""
+    ask = (prompt + "\n\nReturn ONLY a JSON object matching this schema. No "
+           "markdown fence, no commentary, no explanation before or after.\n"
+           + json.dumps(schema))
+    for attempt in range(retries):
+        p = subprocess.run(
+            ["claude", "-p", "--model", CLI_MODEL, "--output-format", "text"],
+            input=ask, capture_output=True, text=True, timeout=900)
+        if p.returncode != 0:
+            raise RuntimeError("claude CLI failed: %s" % p.stderr.strip()[:300])
+        try:
+            return _extract(p.stdout)
+        except (ValueError, json.JSONDecodeError) as e:
+            if attempt == retries - 1:
+                raise RuntimeError("model did not return usable JSON: %s\n%s"
+                                   % (e, p.stdout[:400]))
+            ask += "\n\nYour last reply could not be parsed as JSON (%s). " \
+                   "Return only the raw JSON object." % e
+
+
+def _via_api(prompt, schema, max_tokens, retries=3):
+    key = os.environ["ANTHROPIC_API_KEY"]
     for attempt in range(retries):
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": key, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": MODEL, "max_tokens": max_tokens,
+            json={"model": API_MODEL, "max_tokens": max_tokens,
                   "messages": [{"role": "user", "content": prompt}],
                   "output_config": {"format": {"type": "json_schema",
                                                "schema": schema}}},
@@ -108,7 +145,8 @@ def llm(prompt, schema, max_tokens=16000, retries=3):
         if r.status_code in (429, 500, 502, 503, 529) and attempt < retries - 1:
             time.sleep(5 * (attempt + 1))
             continue
-        r.raise_for_status()
+        if not r.ok:
+            sys.exit("API %d: %s" % (r.status_code, r.text[:500]))
         body = r.json()
         if body.get("stop_reason") == "refusal":
             sys.exit("Model declined: %s" % body.get("stop_details"))
@@ -116,3 +154,17 @@ def llm(prompt, schema, max_tokens=16000, retries=3):
             sys.exit("Hit max_tokens — lower the batch size and retry.")
         return json.loads("".join(b["text"] for b in body["content"]
                                   if b["type"] == "text"))
+
+
+def llm(prompt, schema, max_tokens=16000):
+    """Prefer the Claude Code CLI you are already logged into. ANTHROPIC_API_KEY
+    is only used if you set it deliberately — it gets schema enforcement
+    server-side, which is stricter, but it bills separately."""
+    if os.environ.get("ELO_BACKEND") == "api" and os.environ.get(
+            "ANTHROPIC_API_KEY"):
+        return _via_api(prompt, schema, max_tokens)
+    if shutil.which("claude"):
+        return _via_cli(prompt, schema)
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return _via_api(prompt, schema, max_tokens)
+    sys.exit("No backend: install the Claude Code CLI, or set ANTHROPIC_API_KEY.")

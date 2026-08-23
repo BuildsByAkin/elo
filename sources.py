@@ -1,18 +1,19 @@
-"""Candidate generation: get plausible songs out of all music, not the library.
+"""Two independent answers to "what would I play after this?".
 
-Nothing here judges mood. These are recall engines — they cast wide and cheap,
-and the tagger downstream supplies precision. Every candidate lands in `tracks`
-with external=1 unless it matches something you already own, in which case it
-resolves to the owned row and picks up the ownership boost for free.
+YOUTUBE MUSIC (primary). `get_watch_playlist` is the queue YouTube Music itself
+    builds when you hit play — Google's own "up next", derived from what people
+    actually played. There is no official API for this. ytmusicapi reaches it by
+    POSTing to music.youtube.com/youtubei/v1/, the internal InnerTube endpoints
+    the web player uses, with the exact client context YouTube expects. That is
+    reverse-engineered, not sanctioned: it works unauthenticated today and can
+    break whenever Google changes the payload. Hence the fallback.
 
-Sources, and what each is actually good for:
+LAST.FM (fallback). An official, keyed, stable API built on scrobbles. It
+    returns a real similarity score, which YouTube Music does not — but it goes
+    blind on a lot of catalogue, returning nothing at all rather than erring.
 
-  lastfm_tag      human-applied mood tags at real scale. `betrayal` has 334
-                  taggings here against 6 in MusicBrainz. The workhorse.
-  lastfm_similar  co-listening neighbours of a seed track. Artist adjacency,
-                  not mood — useful for reach, useless alone.
-  model           the model's own recall. Strong on canon, weak on recent and
-                  long-tail, so it is capped rather than trusted.
+Neither is ranked by mood. Both answer adjacency: people who played this played
+that. That is the question this tool asks.
 """
 import os
 import sys
@@ -21,20 +22,80 @@ import time
 import requests
 
 import common
-from tag import THEMES, STANCES
 
 LASTFM = "https://ws.audioscrobbler.com/2.0/"
 UA = {"User-Agent": "elo/0.1 (personal music research)"}
-MODEL_CAP = 0.20          # at most this share of a pool may come from the model
+
+_yt = None
 
 
-def _fm(method, **params):
+def yt():
+    global _yt
+    if _yt is None:
+        try:
+            from ytmusicapi import YTMusic
+        except ImportError:
+            sys.exit("ytmusicapi is not installed — pip install ytmusicapi")
+        _yt = YTMusic()
+    return _yt
+
+
+def _hit(title, artist, cand_title, cand_artist):
+    """Guard against a search confidently returning the wrong song."""
+    a, b = common.norm(title), common.norm(cand_title)
+    if not a or not b or (a not in b and b not in a):
+        return False
+    x, y = common.norm(artist), common.norm(cand_artist)
+    return not x or not y or x in y or y in x
+
+
+def ytm(title, artist, limit=50):
+    """YouTube Music's radio queue. Ordered, but carries no similarity score,
+    so position is the only signal it gives us."""
+    try:
+        res = yt().search("%s %s" % (title, artist), filter="songs", limit=5)
+    except Exception as e:
+        print("  youtube music search failed: %s" % str(e)[:120],
+              file=sys.stderr)
+        return []
+    vid = None
+    for r in res:
+        names = ", ".join(a["name"] for a in (r.get("artists") or []))
+        if _hit(title, artist, r.get("title") or "", names):
+            vid = r["videoId"]
+            break
+    if not vid and res:
+        vid = res[0]["videoId"]           # fall back to the top hit
+    if not vid:
+        return []
+    try:
+        w = yt().get_watch_playlist(videoId=vid, limit=limit)
+    except Exception as e:
+        print("  youtube music radio failed: %s" % str(e)[:120], file=sys.stderr)
+        return []
+    out = []
+    for i, t in enumerate(w.get("tracks") or []):
+        name = t.get("title")
+        who = ", ".join(a["name"] for a in (t.get("artists") or []) if a.get("name"))
+        if not name or not who:
+            continue
+        if i == 0 and _hit(title, artist, name, who):
+            continue                      # the seed itself heads the queue
+        out.append({"title": name, "artist": who, "rank": len(out) + 1,
+                    "score": None, "source": "ytm",
+                    "length": t.get("length") or "",
+                    "album": (t.get("album") or {}).get("name") or "",
+                    "videoId": t.get("videoId") or ""})
+    return out
+
+
+def fm(method, **params):
     key = os.environ.get("LASTFM_API_KEY")
     if not key:
-        sys.exit("LASTFM_API_KEY is not set — put it in .env")
+        return {}
     p = {"method": method, "api_key": key, "format": "json"}
     p.update(params)
-    for attempt in (0, 1, 2):
+    for _ in range(3):
         try:
             r = requests.get(LASTFM, params=p, headers=UA, timeout=30)
         except requests.RequestException:
@@ -50,150 +111,42 @@ def _fm(method, **params):
     return {}
 
 
-def _cand(title, artist, source, weight=1.0):
-    return {"title": (title or "").strip(), "artist": (artist or "").strip(),
-            "source": source, "weight": weight}
-
-
-def lastfm_tag(tag, limit=200):
-    """Top tracks carrying a mood tag. Last.fm's @attr totals are wrong --
-    it reports 14 for `breakup` and then hands back 669 -- so trust len()."""
-    j = _fm("tag.getTopTracks", tag=tag, limit=limit)
-    out = []
-    for t in (j.get("tracks", {}).get("track") or []):
-        name = t.get("name")
-        artist = (t.get("artist") or {}).get("name")
-        if name and artist:
-            out.append(_cand(name, artist, "lastfm:%s" % tag))
-    return out
-
-
-def lastfm_similar(title, artist, limit=100):
-    j = _fm("track.getSimilar", track=title, artist=artist, limit=limit,
-            autocorrect=1)
+def lastfm(title, artist, limit=100):
+    j = fm("track.getSimilar", track=title, artist=artist, limit=limit,
+           autocorrect=1)
     out = []
     for t in (j.get("similartracks", {}).get("track") or []):
-        name = t.get("name")
-        who = (t.get("artist") or {}).get("name")
+        name, who = t.get("name"), (t.get("artist") or {}).get("name")
         if name and who:
-            out.append(_cand(name, who, "lastfm:similar",
-                             float(t.get("match") or 0) or 1.0))
+            out.append({"title": name, "artist": who, "rank": len(out) + 1,
+                        "score": float(t.get("match") or 0.0),
+                        "source": "lastfm", "length": "", "album": "",
+                        "videoId": ""})
     return out
 
 
-def lastfm_track_tags(title, artist, top=8):
-    """What humans call this specific track. Free mood signal for a seed."""
-    j = _fm("track.getTopTags", track=title, artist=artist, autocorrect=1)
-    tags = j.get("toptags", {}).get("tag") or []
-    if isinstance(tags, dict):
-        tags = [tags]
-    return [t["name"].lower() for t in tags[:top] if t.get("name")]
+def fuse(groups, k=60):
+    """Reciprocal rank fusion.
 
-
-MODEL_SCHEMA = {
-    "type": "object", "additionalProperties": False,
-    "required": ["tags", "songs", "target"],
-    "properties": {
-        "tags": {"type": "array", "minItems": 2, "maxItems": 8,
-                 "items": {"type": "string"},
-                 "description": "lowercase Last.fm-style tags to search"},
-        "songs": {"type": "array", "items": {
-            "type": "object", "additionalProperties": False,
-            "required": ["title", "artist"],
-            "properties": {"title": {"type": "string"},
-                           "artist": {"type": "string"}}}},
-        "target": {
-            "type": "object", "additionalProperties": False,
-            "required": ["themes", "stance", "valence", "energy"],
-            "properties": {
-                "themes": {"type": "array", "minItems": 1, "maxItems": 3,
-                           "items": {"type": "string", "enum": THEMES}},
-                "stance": {"type": "string", "enum": STANCES},
-                "valence": {"type": "number", "minimum": 0, "maximum": 10},
-                "energy": {"type": "number", "minimum": 0, "maximum": 10}}}}}
-
-
-def expand(query, n_songs=40):
-    """Turn a request into Last.fm tags to search plus the model's own picks.
-
-    The tags matter more than the songs: they steer the wide, human-tagged
-    sources. The songs are canon-heavy by nature and get capped downstream.
+    The two sources are not comparable directly — Last.fm gives a 0-1 score,
+    YouTube Music gives only a position. RRF throws both scores away and uses
+    rank alone, which is the only thing they share, and rewards a track that
+    both sources placed highly.
     """
-    out = common.llm(
-        'A person asked for music: "%s"\n\n'
-        "Return two things.\n\n"
-        "tags: 2-8 lowercase tags as they would actually be written on "
-        "Last.fm by listeners — single words or short phrases like `breakup`, "
-        "`heartbreak`, `melancholy`, `hype`. Prefer tags people really apply "
-        "over precise ones nobody uses. Include the emotional stance, not just "
-        "the subject.\n\n"
-        "songs: up to %d real, existing songs that fit. Reach past the obvious "
-        "canon — no `I Will Survive`, no `Someone Like You` unless nothing "
-        "else fits. Recent and non-Western tracks are welcome.\n\n"
-        "target: the mood card the ideal answer would have.\n"
-        "THEMES: %s\nSTANCES: %s\n"
-        "valence 0-10 desolate to elated; energy 0-10 still to frantic.\n"
-        % (query, n_songs, ", ".join(THEMES), ", ".join(STANCES)),
-        MODEL_SCHEMA)
-    tags = [t.strip().lower() for t in out["tags"] if t.strip()]
-    songs = [_cand(s["title"], s["artist"], "model") for s in out["songs"]]
-    return tags, songs, out["target"]
-
-
-def dedupe(pools):
-    """Merge candidate lists, keeping the first sighting and noting agreement.
-
-    A track surfaced by three independent sources is a better bet than one
-    surfaced by one, so `hits` is carried forward into ranking.
-    """
-    seen = {}
-    for pool in pools:
-        for c in pool:
-            k = (common.norm(c["title"]), common.norm(c["artist"]))
-            if not k[0]:
+    merged = {}
+    for g in groups:
+        for c in g:
+            key = (common.norm(c["title"]), common.norm(c["artist"]))
+            if not key[0]:
                 continue
-            if k in seen:
-                seen[k]["hits"] += 1
-                seen[k]["sources"].add(c["source"].split(":")[0])
-            else:
-                c = dict(c, hits=1, sources={c["source"].split(":")[0]})
-                seen[k] = c
-    return list(seen.values())
-
-
-def cap_model(cands, share=MODEL_CAP):
-    """Keep the model from flooding the pool with canon."""
-    model = [c for c in cands if c["source"] == "model" and c["hits"] == 1]
-    rest = [c for c in cands if c not in model]
-    allowed = int(len(cands) * share)
-    return rest + model[:allowed]
-
-
-def owned_index(con):
-    idx = {}
-    for tid, title, artist in con.execute(
-            "SELECT id, title, artist FROM tracks WHERE external=0"):
-        idx[(common.norm(title), common.norm(artist))] = tid
-    return idx
-
-
-def persist(con, cands):
-    """Resolve each candidate to a track id, creating external rows as needed."""
-    idx = owned_index(con)
-    for c in cands:
-        k = (common.norm(c["title"]), common.norm(c["artist"]))
-        if k in idx:
-            c["id"], c["owned"] = idx[k], True
-            continue
-        c["owned"] = False
-        row = con.execute("SELECT id FROM tracks WHERE title=? AND artist=?"
-                          " AND album=''", (c["title"], c["artist"])).fetchone()
-        if not row:
-            con.execute("INSERT INTO tracks (title, artist, album, external)"
-                        " VALUES (?,?,'',1)", (c["title"], c["artist"]))
-            row = con.execute("SELECT id FROM tracks WHERE title=? AND artist=?"
-                              " AND album=''",
-                              (c["title"], c["artist"])).fetchone()
-        c["id"] = row[0]
-    con.commit()
-    return cands
+            m = merged.setdefault(key, dict(c, rrf=0.0, sources=set(),
+                                            best_rank=c["rank"]))
+            m["rrf"] += 1.0 / (k + c["rank"])
+            m["sources"].add(c["source"])
+            m["best_rank"] = min(m["best_rank"], c["rank"])
+            if c.get("score") is not None:
+                m["score"] = max(m.get("score") or 0.0, c["score"])
+            for f in ("length", "album", "videoId"):   # keep whichever source has it
+                if not m.get(f) and c.get(f):
+                    m[f] = c[f]
+    return sorted(merged.values(), key=lambda c: (-len(c["sources"]), -c["rrf"]))

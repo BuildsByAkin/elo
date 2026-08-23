@@ -63,6 +63,16 @@ def _titles_match(want_title, want_artist, got_title, got_artist):
 
 
 def from_lrclib(title, artist):
+    # /api/get is an exact signature lookup and is both cheaper and safer than
+    # search — no fuzzy hit to second-guess. It carries most of the coverage;
+    # search is the fallback for near-miss titles.
+    r = _get("https://lrclib.net/api/get", headers=LRC_UA,
+             params={"track_name": title, "artist_name": artist})
+    if r:
+        text = ((r.json() or {}).get("plainLyrics") or "").strip()
+        if text:
+            return text
+
     r = _get("https://lrclib.net/api/search", headers=LRC_UA,
              params={"track_name": title, "artist_name": artist})
     if not r:
@@ -134,6 +144,55 @@ def fetch(con, tracks, pause=0.4):
 
 def load(con, ids):
     ensure(con)
+    ids = list(ids)
+    if not ids:
+        return {}
     q = "SELECT track_id, source, text FROM lyrics WHERE track_id IN (%s)" % (
         ",".join("?" * len(ids)))
-    return {r[0]: (r[1], r[2]) for r in con.execute(q, list(ids))}
+    return {r[0]: (r[1], r[2]) for r in con.execute(q, ids)}
+
+
+def summarise(con):
+    rows = dict(con.execute("SELECT source, count(*) FROM lyrics GROUP BY source"))
+    total = sum(rows.values())
+    if not total:
+        print("no lyrics cached yet")
+        return
+    found = total - rows.get("none", 0)
+    print("\n=== LYRICS ===")
+    print("cached   %d" % total)
+    print("found    %d (%.0f%%)" % (found, 100.0 * found / total))
+    for src, n in sorted(rows.items(), key=lambda x: -x[1]):
+        print("  %-8s %4d" % (src, n))
+
+
+def main():
+    import argparse
+
+    import common
+
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--limit", type=int, default=0,
+                    help="only fetch this many, to sanity-check the output first")
+    ap.add_argument("--stats", action="store_true")
+    a = ap.parse_args()
+
+    con = common.connect()
+    if a.stats:
+        return summarise(con)
+
+    q = ("SELECT id, title, artist FROM tracks WHERE external=0 AND title!=''"
+         " AND id NOT IN (SELECT track_id FROM lyrics) ORDER BY id")
+    if a.limit:
+        q += " LIMIT %d" % a.limit
+    todo = [dict(zip(("id", "title", "artist"), r)) for r in con.execute(q)]
+    if not todo:
+        print("every track already has a lyrics row (hits and misses are both"
+              " cached) — nothing to fetch")
+        return summarise(con)
+    fetch(con, todo)
+    summarise(con)
+
+
+if __name__ == "__main__":
+    main()
