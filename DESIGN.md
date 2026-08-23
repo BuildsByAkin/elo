@@ -247,6 +247,71 @@ correctness problem and becomes a catalogue-bias problem: we will under-serve
 exactly the African and independent music §5 identified, and that bias is the thing
 to watch, not the raw coverage percentage.
 
+## 4a. "Are we going to tag all the music in the world?"
+
+No — but the reason is not the one I first gave, and checking it corrected a
+mistake of mine.
+
+### How much is already tagged for us
+
+The right instinct is to not pay for what someone else has already done.
+Measured, against the pools we actually serve:
+
+| source | what it gives | library | chart | r&b | hip-hop | afrobeats | **workout** |
+|---|---|---|---|---|---|---|---|
+| Last.fm track tags | genre, some mood | 8% | 72% | 56% | 96% | 36% | **0%** |
+| …of those, a *mood* word | | — | 32% | 32% | 40% | 12% | **0%** |
+| MuSe (90k, CC-BY-4.0) | valence + arousal | 5% | 10% | 53% | 35% | **0%** | 12% |
+
+**Correction to §2.1.** That section measured Last.fm track-tag coverage at 8%
+and concluded tags were useless. That number was measured on the *personal
+library* — obscure independent rap, Nigerian gospel, mostly 2020+. It does not
+transfer to the corpus, where candidates come from chart and genre tops and
+coverage is 56–96%. The finding was right about the library and wrong as a
+general claim.
+
+MuSe covers **34% of a real request's candidate pool** (measured on the r&b
+shift's 253 candidates). That is a third of our valence/arousal for free.
+
+### Why free data still cannot be the product
+
+Three holes, and they are the load-bearing ones:
+
+1. **Neither source carries theme or stance.** Tags and MuSe both give a point
+   in mood space. Neither says *breakup* vs *grief* vs *hustle*, and neither
+   says *devastated* vs *defiant*. That is the entire differentiator, and it
+   only comes from reading lyrics.
+2. **MuSe is frozen at 2021.** It covers 10% of the current global chart. New
+   music — which is most of what anyone asks for — is absent.
+3. **Both fail hardest exactly where the user asks.** `tag.getTopTracks(workout)`
+   returns tracks with **0% track tags**, and MuSe covers 12% of them.
+   Afrobeats is 36% tags and **0%** MuSe. Situational requests and non-Western
+   music are where free data collapses, and they are not edge cases.
+
+So free data is a **cost reduction, not an architecture**: take valence and
+arousal from MuSe where it has them, take genre from Last.fm, and spend the LLM
+call only on what nobody else has — theme and stance, plus everything the free
+layers missed.
+
+### The bounded number
+
+We never predict *which* songs get asked for. Two mechanisms remove the need:
+
+- **Lazy.** An unseen request discovers candidates and tags them on the spot.
+  It is slow the first time (~15 calls) and free after. Correctness never
+  depends on having guessed right.
+- **Pre-seed the head.** We do not need every song, only the popular head of
+  each genre — roughly 500 tracks across ~40 genres, ≈20,000 songs, ≈1,000
+  batched calls. Once. Shared by every user forever.
+
+And it amortises hard, because requests reuse each other's work. Measured on
+two independent r&b requests: 253 and 250 candidates, **214 shared — 85%**. The
+second request needed ~36 new songs. Two different genres (r&b vs metal) shared
+**0**, which is why the pre-seed is per-genre rather than global.
+
+20,000 songs is not all the music in the world. It is a fixed, one-time asset
+that grows only when someone asks for something genuinely new.
+
 ## 4b. Architecture — the two designs are complementary, not competing
 
 The working-tree simplification and the HEAD mood engine are solving different
