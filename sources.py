@@ -36,6 +36,7 @@ import time
 
 import requests
 
+import cache
 import common
 
 LASTFM = "https://ws.audioscrobbler.com/2.0/"
@@ -80,6 +81,28 @@ def _artists(entry):
                      if a.get("name"))
 
 
+def _slim(t):
+    """The six fields we actually read, for storing in the cache.
+
+    ytmusicapi hands back the whole InnerTube row — thumbnail sets at five
+    resolutions, tracking params, feedback tokens, like status. Cached whole,
+    one three-segment request weighed nearly a megabyte, almost all of it
+    fields nothing here has ever looked at. Slimming to what is read makes the
+    cache about a tenth the size and, more usefully, makes its format an
+    explicit decision rather than "whatever the library happened to return".
+    """
+    return {"title": t.get("title"),
+            "artists": [{"name": a["name"]}
+                        for a in (t.get("artists") or []) if a.get("name")],
+            "album": {"name": (t.get("album") or {}).get("name") or ""}
+                     if isinstance(t.get("album"), dict) else None,
+            "videoId": t.get("videoId"),
+            "year": t.get("year"),
+            "length": t.get("length"),
+            "duration": t.get("duration"),
+            "duration_seconds": t.get("duration_seconds")}
+
+
 def find(title, artist):
     """Resolve a title/artist to a YouTube Music videoId, or None.
 
@@ -87,15 +110,19 @@ def find(title, artist):
     seeding a radio a near-miss still lands in roughly the right neighbourhood.
     Push does *not* do this — there a wrong match ends up in your playlist.
     """
-    try:
-        res = yt().search("%s %s" % (title, artist), filter="songs", limit=5)
-    except Exception as e:
-        print("  search failed: %s" % str(e)[:120], file=sys.stderr)
-        return None
-    for r in res:
-        if _hit(title, artist, r.get("title") or "", _artists(r)):
-            return r.get("videoId")
-    return res[0].get("videoId") if res else None
+    def go():
+        try:
+            res = yt().search("%s %s" % (title, artist), filter="songs",
+                              limit=5)
+        except Exception as e:
+            print("  search failed: %s" % str(e)[:120], file=sys.stderr)
+            return ""
+        for r in res:
+            if _hit(title, artist, r.get("title") or "", _artists(r)):
+                return r.get("videoId") or ""
+        return (res[0].get("videoId") or "") if res else ""
+
+    return cache.wrap("search", (common.key(title, artist),), go) or None
 
 
 def radio(title, artist, limit=50):
@@ -103,13 +130,17 @@ def radio(title, artist, limit=50):
     vid = find(title, artist)
     if not vid:
         return []
-    try:
-        w = yt().get_watch_playlist(videoId=vid, limit=limit)
-    except Exception as e:
-        print("  radio failed: %s" % str(e)[:120], file=sys.stderr)
-        return []
+
+    def go():
+        try:
+            w = yt().get_watch_playlist(videoId=vid, limit=limit)
+        except Exception as e:
+            print("  radio failed: %s" % str(e)[:120], file=sys.stderr)
+            return []
+        return [_slim(t) for t in (w.get("tracks") or [])]
+
     out = []
-    for i, t in enumerate(w.get("tracks") or []):
+    for i, t in enumerate(cache.wrap("radio", (vid, limit), go)):
         name, who = t.get("title"), _artists(t)
         if not name or not who:
             continue
@@ -134,12 +165,14 @@ def mood_categories():
     global _moods
     with _moods_lock:
         if _moods is None:
-            try:
-                _moods = yt().get_mood_categories() or {}
-            except Exception as e:
-                print("  mood categories failed: %s" % str(e)[:120],
-                      file=sys.stderr)
-                _moods = {}
+            def go():
+                try:
+                    return yt().get_mood_categories() or {}
+                except Exception as e:
+                    print("  mood categories failed: %s" % str(e)[:120],
+                          file=sys.stderr)
+                    return {}
+            _moods = cache.wrap("categories", ("v1",), go)
     return _moods
 
 
@@ -195,6 +228,9 @@ def _shelves(params):
     genre page hands back fifty songs directly and a hundred and forty-five
     playlists; a mood page has a few dozen playlists and no songs.
     """
+    hit = cache.get("shelves", params)
+    if hit is not None:
+        return hit
     try:
         r = yt()._send_request("browse", {
             "browseId": "FEmusic_moods_and_genres_category",
@@ -204,7 +240,7 @@ def _shelves(params):
                      ["sectionListRenderer"]["contents"])
     except Exception as e:
         print("  category page failed: %s" % str(e)[:120], file=sys.stderr)
-        return []
+        return cache.put("shelves", [], params)
 
     out = []
     for section in sections:
@@ -244,8 +280,11 @@ def _shelves(params):
             if bid.startswith("VL"):        # everything else is an artist etc
                 pls.append({"id": bid[2:], "title": name})
         if songs or pls:
-            out.append({"title": title, "songs": songs, "playlists": pls})
-    return out
+            # JSON round-trips lists, not tuples; keep the shape stable so a
+            # hit and a miss are indistinguishable to the caller.
+            out.append({"title": title, "songs": [list(s) for s in songs],
+                        "playlists": pls})
+    return cache.put("shelves", out, params)
 
 
 def mood_pool(name, genres=(), playlists=3, per=60):
@@ -283,12 +322,17 @@ def mood_pool(name, genres=(), playlists=3, per=60):
     ranked.sort(key=lambda r: r[:3])
 
     for _, _, _, pl in ranked[:playlists]:
-        try:
-            full = yt().get_playlist(pl["id"], limit=per)
-        except Exception as e:
-            print("  playlist %s failed: %s" % (pl["id"], str(e)[:90]),
-                  file=sys.stderr)
-            continue
+        def go(pid=pl["id"]):
+            try:
+                full = yt().get_playlist(pid, limit=per)
+            except Exception as e:
+                print("  playlist %s failed: %s" % (pid, str(e)[:90]),
+                      file=sys.stderr)
+                return {}
+            return {"title": full.get("title") or "",
+                    "tracks": [_slim(t) for t in (full.get("tracks") or [])]}
+
+        full = cache.wrap("playlist", (pl["id"], per), go)
         label = "mood:%s/%s" % (name, (full.get("title") or pl["title"])[:24])
         for i, t in enumerate(full.get("tracks") or []):
             name_, who = t.get("title"), _artists(t)
@@ -326,37 +370,49 @@ def fm(method, **params):
     return {}
 
 
-def similar(title, artist, limit=100):
-    j = fm("track.getSimilar", track=title, artist=artist, limit=limit,
-           autocorrect=1)
+def _rows(j, path, with_match=False):
+    """Last.fm replies carry mbids, urls, streamable flags and four image
+    sizes per track. Reduce to the two or three fields anyone reads before it
+    reaches the cache."""
+    node = j
+    for step in path:
+        node = (node or {}).get(step) or {}
     out = []
-    for t in (j.get("similartracks", {}).get("track") or []):
+    for t in (node if isinstance(node, list) else []):
         name, who = t.get("name"), (t.get("artist") or {}).get("name")
-        if name and who:
-            out.append(_cand(name, who, len(out) + 1, "similar",
-                             score=float(t.get("match") or 0.0)))
+        if not name or not who:
+            continue
+        out.append([name, who, float(t.get("match") or 0.0)] if with_match
+                   else [name, who])
     return out
+
+
+def similar(title, artist, limit=100):
+    rows = cache.wrap(
+        "similar", (common.key(title, artist), limit),
+        lambda: _rows(fm("track.getSimilar", track=title, artist=artist,
+                         limit=limit, autocorrect=1),
+                      ("similartracks", "track"), with_match=True))
+    return [_cand(n, a, i + 1, "similar", score=m)
+            for i, (n, a, m) in enumerate(rows)]
 
 
 def tag_top(tag, limit=50):
-    j = fm("tag.getTopTracks", tag=tag, limit=limit)
-    out = []
-    for t in (j.get("tracks", {}).get("track") or []):
-        name, who = t.get("name"), (t.get("artist") or {}).get("name")
-        if name and who:
-            out.append(_cand(name, who, len(out) + 1, "tag:%s" % tag))
-    return out
+    rows = cache.wrap(
+        "tag", (common.norm(tag), limit),
+        lambda: _rows(fm("tag.getTopTracks", tag=tag, limit=limit),
+                      ("tracks", "track")))
+    return [_cand(n, a, i + 1, "tag:%s" % tag)
+            for i, (n, a) in enumerate(rows)]
 
 
 def chart_top(limit=50):
     """The seedless, moodless last resort."""
-    j = fm("chart.getTopTracks", limit=limit)
-    out = []
-    for t in (j.get("tracks", {}).get("track") or []):
-        name, who = t.get("name"), (t.get("artist") or {}).get("name")
-        if name and who:
-            out.append(_cand(name, who, len(out) + 1, "chart"))
-    return out
+    rows = cache.wrap(
+        "chart", (limit,),
+        lambda: _rows(fm("chart.getTopTracks", limit=limit),
+                      ("tracks", "track")))
+    return [_cand(n, a, i + 1, "chart") for i, (n, a) in enumerate(rows)]
 
 
 # -------------------------------------------------------------------- merge

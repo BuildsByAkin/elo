@@ -120,15 +120,31 @@ CREATE TABLE IF NOT EXISTS pushed (
     n           INTEGER NOT NULL DEFAULT 0,
     at          TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS cache (
+    k       TEXT PRIMARY KEY,              -- kind:arguments
+    kind    TEXT NOT NULL,
+    v       TEXT NOT NULL,                 -- JSON
+    fetched REAL NOT NULL,                 -- unix seconds
+    ttl     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cache_kind ON cache (kind);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
 
 def connect():
-    """Open the cache, creating it on first run. An empty cache is normal —
-    it means we have no affinity signal yet, not that anything is wrong."""
+    """Open the store, creating it on first run. An empty one is normal — it
+    means we have no library yet, not that anything is wrong.
+
+    Candidate gathering runs several fetches concurrently and each one writes
+    its result to the cache, so a plain connection would eventually collide on
+    the write lock and raise. A busy timeout makes the loser wait rather than
+    fail; there is no contention worth optimising past that, since the writes
+    are small and the readers are the same process.
+    """
     os.makedirs(os.path.dirname(DB), exist_ok=True)
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB, timeout=30)
+    con.execute("PRAGMA busy_timeout = 30000")
     con.executescript(SCHEMA)
     con.commit()
     return con

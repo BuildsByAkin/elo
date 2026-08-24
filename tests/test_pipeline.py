@@ -17,6 +17,7 @@ os.environ["ELO_DB"] = os.path.join(tempfile.mkdtemp(), "test.db")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import blend            # noqa: E402
+import cache            # noqa: E402
 import common           # noqa: E402
 import feedback as F    # noqa: E402
 import library          # noqa: E402
@@ -800,6 +801,161 @@ class TestPushDedupe(unittest.TestCase):
         self.assertIsNone(self._push([{"title": "Ghost", "artist": "Nobody"}]))
         self.assertEqual(self.yt.calls, [])
         self.assertEqual(push.pushed(), [])
+
+
+class TestCache(unittest.TestCase):
+    """Every request used to re-ask the same questions. A hit and a miss must
+    be indistinguishable to the caller."""
+
+    def setUp(self):
+        cache.clear()
+        cache.enabled = True
+        self.calls = []
+
+    def tearDown(self):
+        cache.enabled = True
+
+    def _fn(self, value):
+        def go():
+            self.calls.append(1)
+            return value
+        return go
+
+    def test_wrap_fetches_once_then_stops(self):
+        for _ in range(3):
+            got = cache.wrap("radio", ("seed", 50), self._fn([{"a": 1}]))
+        self.assertEqual(got, [{"a": 1}])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_cached_empty_list_is_an_answer_not_a_miss(self):
+        cache.wrap("similar", ("x",), self._fn([]))
+        cache.wrap("similar", ("x",), self._fn([]))
+        self.assertEqual(len(self.calls), 1, "None means miss; [] means empty")
+
+    def test_an_empty_result_expires_quickly(self):
+        """Last.fm goes blind on plenty of catalogue and returns nothing
+        rather than erroring; a fortnight of that would be an outage."""
+        cache.put("similar", [], "empty")
+        cache.put("similar", [{"a": 1}], "full")
+        con = common.connect()
+        ttls = dict(con.execute("SELECT k, ttl FROM cache"))
+        self.assertEqual(ttls["similar:empty"], cache.EMPTY_TTL)
+        self.assertEqual(ttls["similar:full"], cache.TTL["similar"])
+        self.assertLess(cache.EMPTY_TTL, cache.TTL["similar"] / 100)
+
+    def test_ttls_differ_by_source(self):
+        """One global TTL would have to suit the fastest-moving source."""
+        self.assertGreater(cache.TTL["categories"], cache.TTL["radio"] * 20)
+        self.assertGreater(cache.TTL["similar"], cache.TTL["radio"])
+
+    def test_expiry_refetches(self):
+        cache.wrap("radio", ("s",), self._fn(["one"]))
+        con = common.connect()
+        con.execute("UPDATE cache SET fetched = fetched - ttl - 1")
+        con.commit()
+        got = cache.wrap("radio", ("s",), self._fn(["two"]))
+        self.assertEqual(got, ["two"])
+        self.assertEqual(len(self.calls), 2)
+
+    def test_disabling_bypasses_both_read_and_write(self):
+        cache.wrap("radio", ("s",), self._fn(["cached"]))
+        cache.enabled = False
+        got = cache.wrap("radio", ("s",), self._fn(["live"]))
+        self.assertEqual(got, ["live"], "--fresh must ignore a hit")
+        cache.enabled = True
+        self.assertEqual(cache.get("radio", "s"), ["cached"],
+                         "--fresh must not overwrite what was there")
+
+    def test_keys_do_not_collide_across_kinds_or_arguments(self):
+        cache.put("radio", ["a"], "seed", 50)
+        cache.put("radio", ["b"], "seed", 30)
+        cache.put("similar", ["c"], "seed", 50)
+        self.assertEqual(cache.get("radio", "seed", 50), ["a"])
+        self.assertEqual(cache.get("radio", "seed", 30), ["b"])
+        self.assertEqual(cache.get("similar", "seed", 50), ["c"])
+
+    def test_a_very_long_key_is_hashed_rather_than_stored(self):
+        long = "x" * 500
+        cache.put("shelves", ["v"], long)
+        self.assertEqual(cache.get("shelves", long), ["v"])
+        k = common.connect().execute("SELECT k FROM cache").fetchone()[0]
+        self.assertLess(len(k), 100)
+
+    def test_a_broken_cache_never_breaks_a_request(self):
+        con = common.connect()
+        con.execute("UPDATE cache SET v='not json'")
+        con.execute("INSERT INTO cache (k,kind,v,fetched,ttl)"
+                    " VALUES ('radio:s','radio','{oops',?,999999)",
+                    (__import__("time").time(),))
+        con.commit()
+        self.assertIsNone(cache.get("radio", "s"))
+        self.assertEqual(cache.wrap("radio", ("s",), self._fn(["ok"])),
+                         ["ok"])
+
+    def test_clear_and_prune(self):
+        cache.put("radio", ["a"], "1")
+        cache.put("tag", ["b"], "2")
+        self.assertEqual(cache.clear("radio"), 1)
+        self.assertIsNone(cache.get("radio", "1"))
+        self.assertEqual(cache.get("tag", "2"), ["b"])
+        con = common.connect()
+        con.execute("UPDATE cache SET fetched = fetched - ttl - 1")
+        con.commit()
+        cache.prune()
+        self.assertEqual(con.execute("SELECT count(*) FROM cache")
+                         .fetchone()[0], 0)
+
+    def test_stats_counts_live_separately_from_stored(self):
+        cache.put("radio", ["a"], "1")
+        con = common.connect()
+        con.execute("UPDATE cache SET fetched = fetched - ttl - 1")
+        con.commit()
+        cache.put("tag", ["b"], "2")
+        by = {r["kind"]: r for r in cache.stats()}
+        self.assertEqual(by["radio"]["live"], 0)
+        self.assertEqual(by["tag"]["live"], 1)
+
+
+class TestCachedPayloadShapes(unittest.TestCase):
+    """What goes into the cache is a decision, not "whatever ytmusicapi
+    returned" — and the consumers must not notice."""
+
+    def test_slim_keeps_every_field_a_consumer_reads(self):
+        raw = {"title": "Often", "videoId": "v1", "year": 2015,
+               "length": "4:10", "duration": "4:10", "duration_seconds": 250,
+               "artists": [{"name": "The Weeknd", "id": "x"}],
+               "album": {"name": "BBTM", "id": "y"},
+               "thumbnails": [{"url": "..."} for _ in range(5)],
+               "feedbackTokens": {"add": "..."}, "likeStatus": "INDIFFERENT"}
+        s = sources._slim(raw)
+        self.assertEqual(s["title"], "Often")
+        self.assertEqual(sources._artists(s), "The Weeknd")
+        self.assertEqual(s["album"]["name"], "BBTM")
+        self.assertEqual((s["videoId"], s["year"], s["length"]),
+                         ("v1", 2015, "4:10"))
+        self.assertNotIn("thumbnails", s)
+        self.assertLess(len(json.dumps(s)), len(json.dumps(raw)) / 2)
+
+    def test_slim_survives_a_row_with_nothing_in_it(self):
+        s = sources._slim({})
+        self.assertIsNone(s["title"])
+        self.assertEqual(sources._artists(s), "")
+
+    def test_lastfm_rows_reduce_to_the_fields_read(self):
+        reply = {"similartracks": {"track": [
+            {"name": "A", "artist": {"name": "X", "mbid": "..."},
+             "match": "0.83", "url": "...", "streamable": {},
+             "image": [{"#text": "..."} for _ in range(4)]},
+            {"name": "B", "artist": {}},          # unusable, dropped
+        ]}}
+        rows = sources._rows(reply, ("similartracks", "track"),
+                             with_match=True)
+        self.assertEqual(rows, [["A", "X", 0.83]])
+
+    def test_lastfm_rows_survive_an_error_reply(self):
+        self.assertEqual(sources._rows({}, ("tracks", "track")), [])
+        self.assertEqual(sources._rows({"tracks": {}}, ("tracks", "track")),
+                         [])
 
 
 class TestYouTubeMusicAuth(unittest.TestCase):

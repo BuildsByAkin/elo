@@ -338,6 +338,57 @@ normalised title and artist — it has to, since most never carry a videoId — 
 "Often" and "Often (Kygo Remix)" can survive as two rows pointing at one
 recording. That is only visible after resolving, and it is caught there.
 
+## Caching
+
+Every request used to re-ask the same questions: the same seed's radio, the
+same curated playlists, the same mood categories. None of it is personal or
+volatile — it is an aggregate of what strangers played — so it caches well.
+
+| | gathering only | full run (one model call) |
+|---|---|---|
+| cold | 11.35s | 12.74s |
+| warm | **0.04s** | **7.47s** |
+| `--fresh` | 10.06s | 12.86s |
+
+Identical candidate counts warm and cold: a hit and a miss return the same
+value, so caching never changes what elo decides. The 7.5s floor is the
+planning model call, which is deliberately not cached — asking the same thing
+twice should be allowed to segment it differently.
+
+**TTLs are per source, because the sources move at different speeds.** The
+mood and genre categories are a navigation structure that changes when Google
+redesigns a page. The playlists behind them are edited weekly-ish. A radio
+queue is regenerated constantly. Last.fm's similarity is computed over years
+of scrobbles and barely moves. One global TTL would have to be short enough
+for the fastest of those and would throw away most of the benefit.
+
+| kind | TTL | |
+|---|---|---|
+| `categories` | 30 days | the mood/genre nav |
+| `similar`, `tag` | 14 days | years of scrobbles behind each number |
+| `shelves`, `search` | 7 days | which playlists sit in a category |
+| `playlist` | 3 days | what is in one |
+| `radio`, `chart` | 1 day | regenerated constantly |
+| *anything empty* | **1 hour** | |
+
+That last row matters. A source returning nothing is usually a source having a
+bad minute — Last.fm goes blind on plenty of catalogue and returns an empty
+list rather than an error. Caching that for a fortnight would turn a transient
+outage into two weeks of silently missing candidates.
+
+**What is stored is a decision, not "whatever the library returned".**
+ytmusicapi hands back the whole InnerTube row: thumbnails at five resolutions,
+tracking params, feedback tokens. Cached whole, one three-segment request
+weighed 967K, nearly all of it fields nothing reads. Reduced to the fields
+consumers actually use it is 269K, and the cache format is explicit.
+
+```
+elo.py cache          rows, live rows, size and age per kind
+elo.py cache prune    drop what has expired
+elo.py cache clear    drop all of it
+elo.py "..." --fresh  ignore it for one run
+```
+
 ## Setup
 
 ```
@@ -408,6 +459,7 @@ elo.py "<request>"           build a playlist
        --max-per-artist N    default 2
        --max-owned F         max share of a block that may be music you own (0.6)
        --dry-run             print the plan and stop
+       --fresh               ignore the cache and refetch every source
        --json                also dump machine-readable output
 
 elo.py no 3 5 | no 2-4 | no "sicko"      that one was wrong
@@ -417,6 +469,7 @@ elo.py last                  the last playlist, numbered
 elo.py feedback              everything learned so far
 elo.py forget [x]            undo one track's verdicts, or all of them
 elo.py pushes                playlists elo has created in your account
+elo.py cache [clear|prune]   what has been fetched and kept
 elo.py auth                  which services are connected
 elo.py auth ytmusic [file]   paste your YouTube Music headers
 elo.py import apple <file>   Music.app > File > Library > Export Library
@@ -441,6 +494,7 @@ ytauth.py    YouTube Music credentials, and knowing when they have died
 library.py   the store all three import into, and the merge rules
 taste.py     your library -> candidates and weights  (0 calls)
 feedback.py  "not that one", scoped to the block it was said in
+cache.py     per-source TTLs over everything fetched from the two services
 blend.py     gather, weigh, order, stitch            (1 call per segment)
 push.py      write the playlist to YouTube Music
 common.py    env, cache, title matching, the model call

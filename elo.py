@@ -26,6 +26,7 @@ Subcommands:
     elo.py last                   the last playlist, numbered
     elo.py feedback / forget      what has been learned, and undoing it
     elo.py pushes                 playlists elo has created in your account
+    elo.py cache [clear|prune]    what has been fetched and kept
     elo.py auth                   which services are connected
     elo.py auth ytmusic [file]    paste your YouTube Music headers
     elo.py import apple <file>    Music.app > File > Library > Export Library
@@ -180,10 +181,13 @@ def cmd_auth(args):
 
 def cmd_build(args):
     import blend
+    import cache
     import plan
     import push
     import taste as T
 
+    if args.fresh:
+        cache.enabled = False
     started = time.time()
     spec = plan.parse(args.request)
     print(plan.describe(spec), file=sys.stderr)
@@ -248,6 +252,10 @@ def main():
     if argv and argv[0] in ("pushes", "pushed"):
         import push
         return push.show()
+    if argv and argv[0] == "cache":
+        import cache
+        sys.argv = ["cache"] + argv[1:]
+        return cache.main()
     if argv and argv[0] == "forget":
         return cmd_forget(argv[1:])
     if argv and argv[0] == "again":
@@ -276,6 +284,8 @@ def main():
                    metavar="F",
                    help="max share of each block that may be music you already"
                         " own (default 0.6; 1.0 to disable)")
+    p.add_argument("--fresh", action="store_true",
+                   help="ignore the cache and refetch every source")
     p.add_argument("--json", action="store_true", help="also dump JSON")
     p.add_argument("--dry-run", action="store_true",
                    help="print the plan and stop before gathering")
