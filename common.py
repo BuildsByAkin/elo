@@ -112,6 +112,14 @@ CREATE TABLE IF NOT EXISTS last_playlist (
     request   TEXT NOT NULL DEFAULT '',
     at        TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS pushed (
+    playlist_id TEXT PRIMARY KEY,
+    title       TEXT NOT NULL DEFAULT '',
+    request     TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT '',  -- the track set, order-independent
+    n           INTEGER NOT NULL DEFAULT 0,
+    at          TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 

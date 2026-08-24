@@ -5,6 +5,8 @@ worth pinning down here is the arithmetic the design leans on: that fusion
 rewards agreement and respects its weights, that library affinity reorders a
 shortlist rather than filtering it, and that a block lands on its minutes.
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -18,6 +20,7 @@ import blend            # noqa: E402
 import common           # noqa: E402
 import feedback as F    # noqa: E402
 import library          # noqa: E402
+import push             # noqa: E402
 import sources          # noqa: E402
 import taste as T       # noqa: E402
 import ytauth           # noqa: E402
@@ -631,6 +634,172 @@ class TestFeedback(unittest.TestCase):
         s = F.summary()
         self.assertEqual(len(s["drops"]), 1)
         self.assertEqual(len(s["keeps"]), 0)
+
+
+class FakeYT(object):
+    """Enough of YTMusic to exercise the push paths without an account."""
+
+    def __init__(self, playlists=None, missing=()):
+        self.playlists = playlists or {}     # pid -> [(videoId, setVideoId)]
+        self.missing = set(missing)          # pids that 404
+        self.calls = []
+        self.next_id = 100
+
+    def get_playlist(self, pid, limit=100, **kw):
+        if pid in self.missing or pid not in self.playlists:
+            raise RuntimeError("404")
+        return {"tracks": [{"videoId": v, "setVideoId": s}
+                           for v, s in self.playlists[pid]]}
+
+    def create_playlist(self, title, desc, privacy="PRIVATE", video_ids=None,
+                        **kw):
+        pid = "PL%d" % self.next_id
+        self.next_id += 1
+        self.playlists[pid] = [(v, "set-" + v) for v in (video_ids or [])]
+        self.calls.append(("create", title, list(video_ids or [])))
+        return pid
+
+    def add_playlist_items(self, pid, videoIds=None, duplicates=False, **kw):
+        self.calls.append(("add", pid, list(videoIds or [])))
+        self.playlists[pid] += [(v, "set-" + v) for v in (videoIds or [])]
+        return "STATUS_SUCCEEDED"
+
+    def remove_playlist_items(self, pid, videos):
+        gone = {v["videoId"] for v in videos}
+        self.calls.append(("remove", pid, sorted(gone)))
+        self.playlists[pid] = [(v, s) for v, s in self.playlists[pid]
+                               if v not in gone]
+        return "STATUS_SUCCEEDED"
+
+    def search(self, *a, **kw):
+        return []
+
+
+def track(title, artist, vid):
+    return {"title": title, "artist": artist, "video_id": vid}
+
+
+class TestPushDedupe(unittest.TestCase):
+    """A tool that only ever calls create_playlist turns an account into a
+    landfill: four evenings of "hip hop bangers" is four playlists."""
+
+    def setUp(self):
+        con = common.connect()
+        con.execute("DELETE FROM pushed")
+        con.commit()
+        self.yt = FakeYT()
+        self._client, self._require = push.client, None
+        push.client = lambda need_auth=True: self.yt
+        import ytauth
+        self._require = ytauth.require
+        ytauth.require = lambda action="": {"ok": True}
+
+    def tearDown(self):
+        push.client = self._client
+        import ytauth
+        ytauth.require = self._require
+
+    def _push(self, tracks, title="Bangers", **kw):
+        # push narrates to stderr, which is right in use and noise in a test.
+        with contextlib.redirect_stderr(io.StringIO()):
+            return push.create(tracks, title, request="r", quiet=True, **kw)
+
+    # -- the pure parts ---------------------------------------------------
+
+    def test_fingerprint_ignores_order_but_not_content(self):
+        self.assertEqual(push.fingerprint(["a", "b"]),
+                         push.fingerprint(["b", "a"]))
+        self.assertNotEqual(push.fingerprint(["a", "b"]),
+                            push.fingerprint(["a", "c"]))
+        self.assertEqual(push.fingerprint([]), "")
+
+    def test_dedupe_catches_two_titles_for_one_recording(self):
+        """Fusion merges on title+artist, so `Often` and `Often (Kygo Remix)`
+        survive as two rows pointing at one video."""
+        pairs = [(track("Often", "The Weeknd", "v1"), "v1"),
+                 (track("Often (Kygo Remix)", "The Weeknd", "v1"), "v1"),
+                 (track("Other", "X", "v2"), "v2")]
+        kept, dropped = push.dedupe(pairs)
+        self.assertEqual([v for _, v in kept], ["v1", "v2"])
+        self.assertEqual(len(dropped), 1)
+
+    def test_decide(self):
+        hist = [{"title": "Bangers", "fingerprint": push.fingerprint(["a"]),
+                 "playlist_id": "PL1"}]
+        self.assertEqual(push.decide("Bangers", ["a"], hist)[0], "unchanged")
+        self.assertEqual(push.decide("Bangers", ["a", "b"], hist)[0], "update")
+        self.assertEqual(push.decide("Other", ["a"], hist)[0], "create")
+        self.assertEqual(push.decide("Bangers", ["a"], hist, new=True)[0],
+                         "create")
+
+    def test_decide_never_touches_a_playlist_we_did_not_make(self):
+        """Title collision with a hand-made playlist must not update it."""
+        self.assertEqual(push.decide("My Own Mix", ["a"], [])[0], "create")
+
+    # -- end to end against the fake -------------------------------------
+
+    def test_first_push_creates(self):
+        pid = self._push([track("A", "X", "v1"), track("B", "Y", "v2")])
+        self.assertEqual([c[0] for c in self.yt.calls], ["create"])
+        self.assertEqual(len(push.pushed()), 1)
+        self.assertEqual(push.pushed()[0]["n"], 2)
+        self.assertIn(pid, self.yt.playlists)
+
+    def test_pushing_the_same_thing_twice_does_nothing(self):
+        first = self._push([track("A", "X", "v1")])
+        self.yt.calls = []
+        again = self._push([track("A", "X", "v1")])
+        self.assertEqual(again, first)
+        self.assertEqual(self.yt.calls, [], "must not write anything")
+        self.assertEqual(len(push.pushed()), 1)
+
+    def test_a_changed_playlist_updates_in_place_and_keeps_its_url(self):
+        first = self._push([track("A", "X", "v1"), track("B", "Y", "v2")])
+        self.yt.calls = []
+        again = self._push([track("A", "X", "v1"), track("C", "Z", "v3")])
+        self.assertEqual(again, first, "the URL must survive an update")
+        kinds = {c[0]: c for c in self.yt.calls}
+        self.assertEqual(kinds["add"][2], ["v3"])
+        self.assertEqual(kinds["remove"][2], ["v2"])
+        self.assertNotIn("create", kinds)
+        self.assertEqual(sorted(v for v, _ in self.yt.playlists[first]),
+                         ["v1", "v3"])
+        self.assertEqual(len(push.pushed()), 1)
+
+    def test_new_forces_a_second_playlist(self):
+        first = self._push([track("A", "X", "v1")])
+        second = self._push([track("A", "X", "v1")], new=True)
+        self.assertNotEqual(first, second)
+        self.assertEqual(len(push.pushed()), 2)
+
+    def test_a_deleted_playlist_does_not_turn_a_push_into_a_no_op(self):
+        """The local record can be stale — you deleted it from the app."""
+        first = self._push([track("A", "X", "v1")])
+        self.yt.missing.add(first)
+        self.yt.calls = []
+        again = self._push([track("A", "X", "v1")])
+        self.assertNotEqual(again, first)
+        self.assertEqual([c[0] for c in self.yt.calls], ["create"])
+
+    def test_a_deleted_playlist_falls_back_to_create_on_update_too(self):
+        first = self._push([track("A", "X", "v1")])
+        self.yt.missing.add(first)
+        again = self._push([track("B", "Y", "v2")])
+        self.assertNotEqual(again, first)
+        self.assertEqual([c[0] for c in self.yt.calls
+                          if c[0] == "create"], ["create", "create"])
+
+    def test_duplicates_never_reach_the_playlist(self):
+        pid = self._push([track("Often", "The Weeknd", "v1"),
+                          track("Often (Remix)", "The Weeknd", "v1"),
+                          track("Other", "X", "v2")])
+        self.assertEqual(sorted(v for v, _ in self.yt.playlists[pid]),
+                         ["v1", "v2"])
+
+    def test_nothing_resolvable_writes_nothing(self):
+        self.assertIsNone(self._push([{"title": "Ghost", "artist": "Nobody"}]))
+        self.assertEqual(self.yt.calls, [])
+        self.assertEqual(push.pushed(), [])
 
 
 class TestYouTubeMusicAuth(unittest.TestCase):

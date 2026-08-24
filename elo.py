@@ -25,6 +25,7 @@ Subcommands:
     elo.py again                  rebuild the last request with that applied
     elo.py last                   the last playlist, numbered
     elo.py feedback / forget      what has been learned, and undoing it
+    elo.py pushes                 playlists elo has created in your account
     elo.py auth                   which services are connected
     elo.py auth ytmusic [file]    paste your YouTube Music headers
     elo.py import apple <file>    Music.app > File > Library > Export Library
@@ -222,8 +223,8 @@ def cmd_build(args):
 
     if args.push:
         title = args.title or spec.get("title") or args.request[:90]
-        push.create(tracks, title,
-                    description=spec.get("reason", "")[:280], quiet=True)
+        push.create(tracks, title, description=spec.get("reason", "")[:280],
+                    request=args.request, new=args.new, quiet=True)
 
 
 def main():
@@ -244,6 +245,9 @@ def main():
         return cmd_last()
     if argv and argv[0] == "feedback":
         return cmd_feedback()
+    if argv and argv[0] in ("pushes", "pushed"):
+        import push
+        return push.show()
     if argv and argv[0] == "forget":
         return cmd_forget(argv[1:])
     if argv and argv[0] == "again":
@@ -259,6 +263,10 @@ def main():
     p.add_argument("--push", action="store_true",
                    help="create the playlist in your YouTube Music account")
     p.add_argument("--title", help="playlist name (default: the model's)")
+    p.add_argument("--new", action="store_true",
+                   help="always create a new playlist; by default a second "
+                        "push of the same title updates the one elo already "
+                        "made rather than piling up copies")
     p.add_argument("--no-llm", action="store_true",
                    help="skip the ordering calls; take the code ranking as-is")
     p.add_argument("--wide", type=int, default=2, metavar="N",

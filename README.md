@@ -299,6 +299,45 @@ songs.
 `elo.py feedback` shows everything learned; `elo.py forget "sicko"` or
 `elo.py forget all` undoes it.
 
+## Pushing without piling up duplicates
+
+A tool that only ever calls `create_playlist` turns an account into a landfill:
+ask for "hip hop bangers" on four evenings and you own four playlists with the
+same name and overlapping contents, and the good one is whichever you can still
+find.
+
+So every push is recorded — id, title, and an order-independent fingerprint of
+the track set — and a second push of the same title **updates that playlist in
+place**:
+
+```
+$ elo.py "hip hop bangers, 20 min" --push      created 'Bangers' with 6 tracks
+$ elo.py again --push                          updated 'Bangers': +2, -1
+$ elo.py again --push                          already pushed exactly these — nothing to do
+$ elo.py "..." --push --new                    creates a second copy anyway
+$ elo.py pushes                                everything elo has made
+```
+
+Updating diffs against what is already there and only adds what is missing and
+removes what is no longer wanted, so the playlist keeps its URL, its place in
+your library, and anything you reordered by hand.
+
+Three rules keep this from being destructive:
+
+- **Only playlists elo created.** A title collision with something you made by
+  hand creates a new playlist instead, because there is no record of us having
+  made yours.
+- **The record is verified before it is trusted.** You may have deleted the
+  playlist since; a stale local row falls back to creating rather than turning
+  a push into a silent no-op.
+- **Order-independent fingerprint.** A rebuild that returns the same songs in a
+  different sequence is the same playlist, not new work.
+
+Deduplication also happens on the tracks themselves. Fusion merges candidates on
+normalised title and artist — it has to, since most never carry a videoId — so
+"Often" and "Often (Kygo Remix)" can survive as two rows pointing at one
+recording. That is only visible after resolving, and it is caught there.
+
 ## Setup
 
 ```
@@ -362,6 +401,7 @@ one is put back if it fails.
 ```
 elo.py "<request>"           build a playlist
        --push                create it in your YouTube Music account
+       --new                 always create; default updates the one elo made
        --title NAME          playlist name (default: the model picks one)
        --no-llm              skip the ordering calls, take the code ranking
        --wide N              expand from N of the strongest candidates (default 2)
@@ -376,6 +416,7 @@ elo.py again                 rebuild the last request with feedback applied
 elo.py last                  the last playlist, numbered
 elo.py feedback              everything learned so far
 elo.py forget [x]            undo one track's verdicts, or all of them
+elo.py pushes                playlists elo has created in your account
 elo.py auth                  which services are connected
 elo.py auth ytmusic [file]   paste your YouTube Music headers
 elo.py import apple <file>   Music.app > File > Library > Export Library
