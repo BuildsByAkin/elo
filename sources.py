@@ -1,22 +1,37 @@
-"""Two independent answers to "what would I play after this?".
+"""Where candidate tracks come from. No mood model, no tagging — just other
+people's listening, asked four different ways.
 
-YOUTUBE MUSIC (primary). `get_watch_playlist` is the queue YouTube Music itself
-    builds when you hit play — Google's own "up next", derived from what people
-    actually played. There is no official API for this. ytmusicapi reaches it by
-    POSTing to music.youtube.com/youtubei/v1/, the internal InnerTube endpoints
-    the web player uses, with the exact client context YouTube expects. That is
-    reverse-engineered, not sanctioned: it works unauthenticated today and can
-    break whenever Google changes the payload. Hence the fallback.
+RADIO (YouTube Music, unauthenticated). `get_watch_playlist` is the queue
+    YouTube Music builds when you press play: Google's own "up next", derived
+    from what people actually played after this song. This is the core signal
+    the whole tool rests on. There is no official API for it; ytmusicapi
+    reaches the internal InnerTube endpoints the web player uses, which works
+    today and can break whenever Google changes the payload.
 
-LAST.FM (fallback). An official, keyed, stable API built on scrobbles. It
-    returns a real similarity score, which YouTube Music does not — but it goes
-    blind on a lot of catalogue, returning nothing at all rather than erring.
+SIMILAR (Last.fm). An official, keyed, stable API built on scrobbles, and the
+    only source that returns a real similarity *score*. It goes blind on a lot
+    of catalogue — returning nothing rather than erring — so it is a second
+    opinion, not a replacement.
 
-Neither is ranked by mood. Both answer adjacency: people who played this played
-that. That is the question this tool asks.
+MOOD POOL (YouTube Music). `get_mood_categories` exposes eleven human-curated
+    moods (Chill, Sad, Party, Workout...) and twenty-seven genres, each backed
+    by dozens of editorial playlists of eighty-odd tracks. This is how a
+    segment gets candidates when nothing similar to the seed belongs in it —
+    you cannot reach "happy" by asking a sad song's radio for neighbours.
+
+TAG TOP (Last.fm). `tag.getTopTracks` for the same job when a mood or genre
+    word has no YouTube Music category. Ask it for "shoegaze", not for
+    "melancholy": its tag mass sits on genre and decade, not emotion.
+
+Radio and mood-pool tracks arrive carrying a videoId and a duration, which
+means they can be pushed to a playlist with no further lookup and their length
+is known rather than assumed. Last.fm tracks carry neither and have to be
+resolved at push time. That asymmetry is why fusion keeps whichever fields a
+source happened to supply.
 """
 import os
 import sys
+import threading
 import time
 
 import requests
@@ -24,70 +39,270 @@ import requests
 import common
 
 LASTFM = "https://ws.audioscrobbler.com/2.0/"
-UA = {"User-Agent": "elo/0.1 (personal music research)"}
+UA = {"User-Agent": "elo/0.2 (personal music research)"}
 
-_yt = None
+_local = threading.local()
+_moods_lock = threading.Lock()
+_moods = None
 
 
 def yt():
-    global _yt
-    if _yt is None:
+    """One unauthenticated client per thread. ytmusicapi wraps a requests
+    Session, and candidate gathering runs several fetches concurrently."""
+    client = getattr(_local, "yt", None)
+    if client is None:
         try:
             from ytmusicapi import YTMusic
         except ImportError:
             sys.exit("ytmusicapi is not installed — pip install ytmusicapi")
-        _yt = YTMusic()
-    return _yt
+        client = _local.yt = YTMusic()
+    return client
 
 
-def _hit(title, artist, cand_title, cand_artist):
+def _cand(title, artist, rank, source, **kw):
+    return {"title": common.clean(title), "artist": artist,
+            "album": kw.get("album", ""), "video_id": kw.get("video_id", ""),
+            "secs": kw.get("secs", 0), "year": kw.get("year", ""),
+            "rank": rank, "score": kw.get("score"), "source": source}
+
+
+def _hit(want_t, want_a, got_t, got_a):
     """Guard against a search confidently returning the wrong song."""
-    a, b = common.norm(title), common.norm(cand_title)
+    a, b = common.norm(want_t), common.norm(got_t)
     if not a or not b or (a not in b and b not in a):
         return False
-    x, y = common.norm(artist), common.norm(cand_artist)
+    x, y = common.norm(want_a), common.norm(got_a)
     return not x or not y or x in y or y in x
 
 
-def ytm(title, artist, limit=50):
-    """YouTube Music's radio queue. Ordered, but carries no similarity score,
-    so position is the only signal it gives us."""
+def _artists(entry):
+    return ", ".join(a["name"] for a in (entry.get("artists") or [])
+                     if a.get("name"))
+
+
+def find(title, artist):
+    """Resolve a title/artist to a YouTube Music videoId, or None.
+
+    Falls back to the top hit when nothing matches confidently, because for
+    seeding a radio a near-miss still lands in roughly the right neighbourhood.
+    Push does *not* do this — there a wrong match ends up in your playlist.
+    """
     try:
         res = yt().search("%s %s" % (title, artist), filter="songs", limit=5)
     except Exception as e:
-        print("  youtube music search failed: %s" % str(e)[:120],
-              file=sys.stderr)
-        return []
-    vid = None
+        print("  search failed: %s" % str(e)[:120], file=sys.stderr)
+        return None
     for r in res:
-        names = ", ".join(a["name"] for a in (r.get("artists") or []))
-        if _hit(title, artist, r.get("title") or "", names):
-            vid = r["videoId"]
-            break
-    if not vid and res:
-        vid = res[0]["videoId"]           # fall back to the top hit
+        if _hit(title, artist, r.get("title") or "", _artists(r)):
+            return r.get("videoId")
+    return res[0].get("videoId") if res else None
+
+
+def radio(title, artist, limit=50):
+    """What YouTube Music plays after this song."""
+    vid = find(title, artist)
     if not vid:
         return []
     try:
         w = yt().get_watch_playlist(videoId=vid, limit=limit)
     except Exception as e:
-        print("  youtube music radio failed: %s" % str(e)[:120], file=sys.stderr)
+        print("  radio failed: %s" % str(e)[:120], file=sys.stderr)
         return []
     out = []
     for i, t in enumerate(w.get("tracks") or []):
-        name = t.get("title")
-        who = ", ".join(a["name"] for a in (t.get("artists") or []) if a.get("name"))
+        name, who = t.get("title"), _artists(t)
         if not name or not who:
             continue
         if i == 0 and _hit(title, artist, name, who):
             continue                      # the seed itself heads the queue
-        out.append({"title": name, "artist": who, "rank": len(out) + 1,
-                    "score": None, "source": "ytm",
-                    "length": t.get("length") or "",
-                    "album": (t.get("album") or {}).get("name") or "",
-                    "videoId": t.get("videoId") or ""})
+        out.append(_cand(name, who, len(out) + 1, "radio",
+                         album=(t.get("album") or {}).get("name") or "",
+                         video_id=t.get("videoId") or "",
+                         year=str(t.get("year") or ""),
+                         secs=common.seconds(t.get("length"))))
     return out
 
+
+# ------------------------------------------------------------ youtube moods
+
+def mood_categories():
+    """The eleven moods and twenty-seven genres YouTube Music curates.
+
+    Fetched once per process and shared: it is the same list for everybody and
+    changes about as often as Google redesigns the home page.
+    """
+    global _moods
+    with _moods_lock:
+        if _moods is None:
+            try:
+                _moods = yt().get_mood_categories() or {}
+            except Exception as e:
+                print("  mood categories failed: %s" % str(e)[:120],
+                      file=sys.stderr)
+                _moods = {}
+    return _moods
+
+
+def mood_names():
+    """Flat list of every category title, moods first."""
+    cats = mood_categories()
+    out = []
+    for section in ("Moods & moments", "Genres"):
+        out += [c["title"] for c in cats.get(section, [])]
+    for section, items in cats.items():
+        if section not in ("Moods & moments", "Genres"):
+            out += [c["title"] for c in items]
+    return out
+
+
+def _mood_params(name):
+    want = common.norm(name)
+    if not want:
+        return None
+    best = None
+    for items in mood_categories().values():
+        for c in items:
+            got = common.norm(c["title"])
+            if got == want:
+                return c["params"]
+            if best is None and (want in got or got in want):
+                best = c["params"]
+    return best
+
+
+# Shelves that are on the page but are not music we can queue.
+_SKIP_SHELF = ("music videos", "artists", "new releases", "videos",
+               "featured artists", "similar artists")
+
+
+def _shelves(params):
+    """Parse a mood/genre category page into `{title, songs, playlists}`.
+
+    ytmusicapi has `get_mood_playlists` for this, and it works on the eleven
+    mood categories and fails on all twenty-seven genre ones — a genre page
+    leads with a shelf of songs rather than playlists, and the parser walks
+    into it expecting a playlist and raises. Rather than lose every genre pool,
+    the page is walked here.
+
+    That means reaching past the library into `_send_request`, which is a
+    private method. It is a smaller bet than it sounds: the endpoint underneath
+    is already unofficial, and this parser is *more* tolerant than the one it
+    replaces — it skips shelves it does not recognise instead of raising on
+    them, so the next time YouTube Music adds a shelf type it costs us that
+    shelf rather than the request.
+
+    The trade is worth making because the genre pages are the better data. A
+    genre page hands back fifty songs directly and a hundred and forty-five
+    playlists; a mood page has a few dozen playlists and no songs.
+    """
+    try:
+        r = yt()._send_request("browse", {
+            "browseId": "FEmusic_moods_and_genres_category",
+            "params": params})
+        sections = (r["contents"]["singleColumnBrowseResultsRenderer"]
+                     ["tabs"][0]["tabRenderer"]["content"]
+                     ["sectionListRenderer"]["contents"])
+    except Exception as e:
+        print("  category page failed: %s" % str(e)[:120], file=sys.stderr)
+        return []
+
+    out = []
+    for section in sections:
+        shelf = section.get("musicCarouselShelfRenderer")
+        if not shelf:
+            continue
+        try:
+            title = (shelf["header"]["musicCarouselShelfBasicHeaderRenderer"]
+                          ["title"]["runs"][0]["text"])
+        except (KeyError, IndexError):
+            title = ""
+        if common.norm(title) in [common.norm(s) for s in _SKIP_SHELF]:
+            continue
+        songs, pls = [], []
+        for item in shelf.get("contents") or []:
+            row = item.get("musicResponsiveListItemRenderer")
+            if row:
+                cols = []
+                for fc in row.get("flexColumns") or []:
+                    runs = (fc.get("musicResponsiveListItemFlexColumnRenderer")
+                            or {}).get("text", {}).get("runs") or []
+                    cols.append([x.get("text", "") for x in runs])
+                vid = (row.get("playlistItemData") or {}).get("videoId") or ""
+                if cols and cols[0] and vid:
+                    who = " ".join(cols[1]).split(" • ")[0] if len(cols) > 1 \
+                        else ""
+                    songs.append((cols[0][0], who.strip(), vid))
+                continue
+            two = item.get("musicTwoRowItemRenderer")
+            if not two:
+                continue
+            try:
+                name = two["title"]["runs"][0]["text"]
+                bid = two["navigationEndpoint"]["browseEndpoint"]["browseId"]
+            except (KeyError, IndexError):
+                continue
+            if bid.startswith("VL"):        # everything else is an artist etc
+                pls.append({"id": bid[2:], "title": name})
+        if songs or pls:
+            out.append({"title": title, "songs": songs, "playlists": pls})
+    return out
+
+
+def mood_pool(name, genres=(), playlists=3, per=60):
+    """Tracks from a YouTube Music mood or genre category.
+
+    A category holds dozens of curated playlists and we only want a few. When
+    the request named a genre, playlists whose title or shelf mentions it sort
+    first — `Hip Hop Heartbreak` beats `Country Breakup` for an r&b request —
+    and that is a one-line ranking rather than another model call. Otherwise
+    the category's own ordering stands, which is YouTube Music's editorial
+    priority.
+    """
+    params = _mood_params(name)
+    if not params:
+        return []
+    shelves = _shelves(params)
+    if not shelves:
+        return []
+    words = [common.norm(g) for g in genres if common.norm(g)]
+
+    out = []
+    for sh in shelves:                    # songs sitting on the page directly
+        for i, (title, who, vid) in enumerate(sh["songs"]):
+            if title and who:
+                out.append(_cand(title, who, i + 1,
+                                 "mood:%s/%s" % (name, sh["title"][:24]),
+                                 video_id=vid))
+
+    ranked = []
+    for order, sh in enumerate(shelves):
+        for i, pl in enumerate(sh["playlists"]):
+            hit = sum(w in common.norm(pl["title"] + " " + sh["title"])
+                      for w in words)
+            ranked.append((-hit, order, i, pl))
+    ranked.sort(key=lambda r: r[:3])
+
+    for _, _, _, pl in ranked[:playlists]:
+        try:
+            full = yt().get_playlist(pl["id"], limit=per)
+        except Exception as e:
+            print("  playlist %s failed: %s" % (pl["id"], str(e)[:90]),
+                  file=sys.stderr)
+            continue
+        label = "mood:%s/%s" % (name, (full.get("title") or pl["title"])[:24])
+        for i, t in enumerate(full.get("tracks") or []):
+            name_, who = t.get("title"), _artists(t)
+            if not name_ or not who:
+                continue
+            out.append(_cand(name_, who, i + 1, label,
+                             album=(t.get("album") or {}).get("name") or "",
+                             video_id=t.get("videoId") or "",
+                             secs=common.seconds(t.get("duration"))
+                                  or int(t.get("duration_seconds") or 0)))
+    return out
+
+
+# ------------------------------------------------------------------ last.fm
 
 def fm(method, **params):
     key = os.environ.get("LASTFM_API_KEY")
@@ -111,76 +326,77 @@ def fm(method, **params):
     return {}
 
 
-def lastfm(title, artist, limit=100):
+def similar(title, artist, limit=100):
     j = fm("track.getSimilar", track=title, artist=artist, limit=limit,
            autocorrect=1)
     out = []
     for t in (j.get("similartracks", {}).get("track") or []):
         name, who = t.get("name"), (t.get("artist") or {}).get("name")
         if name and who:
-            out.append({"title": name, "artist": who, "rank": len(out) + 1,
-                        "score": float(t.get("match") or 0.0),
-                        "source": "lastfm", "length": "", "album": "",
-                        "videoId": ""})
+            out.append(_cand(name, who, len(out) + 1, "similar",
+                             score=float(t.get("match") or 0.0)))
     return out
 
 
 def tag_top(tag, limit=50):
-    """Top tracks for a Last.fm tag — this is the job tags are actually good at.
-
-    DESIGN.md §2.1 killed Last.fm as a *mood* signal: 8% track-tag coverage on
-    a real library, and the tag mass sits on genre, decade and artist identity
-    rather than emotion. That same concentration is why it is a good *genre*
-    candidate source. Ask it for "r&b", not for "melancholy" — it supplies the
-    pool, our cards supply the mood.
-    """
     j = fm("tag.getTopTracks", tag=tag, limit=limit)
     out = []
     for t in (j.get("tracks", {}).get("track") or []):
         name, who = t.get("name"), (t.get("artist") or {}).get("name")
         if name and who:
-            out.append({"title": name, "artist": who, "rank": len(out) + 1,
-                        "score": None, "source": "lastfm-tag:%s" % tag,
-                        "length": "", "album": "", "videoId": ""})
+            out.append(_cand(name, who, len(out) + 1, "tag:%s" % tag))
     return out
 
 
 def chart_top(limit=50):
-    """Globally popular tracks — the seedless fallback when the request carries
-    no genre hint at all."""
+    """The seedless, moodless last resort."""
     j = fm("chart.getTopTracks", limit=limit)
     out = []
     for t in (j.get("tracks", {}).get("track") or []):
         name, who = t.get("name"), (t.get("artist") or {}).get("name")
         if name and who:
-            out.append({"title": name, "artist": who, "rank": len(out) + 1,
-                        "score": None, "source": "lastfm-chart",
-                        "length": "", "album": "", "videoId": ""})
+            out.append(_cand(name, who, len(out) + 1, "chart"))
     return out
 
 
-def fuse(groups, k=60):
-    """Reciprocal rank fusion.
+# -------------------------------------------------------------------- merge
 
-    The two sources are not comparable directly — Last.fm gives a 0-1 score,
-    YouTube Music gives only a position. RRF throws both scores away and uses
-    rank alone, which is the only thing they share, and rewards a track that
-    both sources placed highly.
+def fuse(groups, k=60):
+    """Reciprocal rank fusion over `(weight, candidates)` groups.
+
+    The sources are not comparable directly — Last.fm gives a 0-1 score, the
+    others give only a position. RRF throws the scores away and uses rank
+    alone, the one thing they share, and rewards a track more than one source
+    placed highly. Agreement between an editorial playlist and a radio queue is
+    the strongest evidence we have that a track belongs.
+
+    The per-group weight is what lets one seed serve a whole journey. In a
+    sad-to-happy shift the seed's radio is fetched once and offered to every
+    segment, at full weight in the opening block and at a third of it later
+    on. It stops being a source of tracks and becomes a tiebreaker: a song that
+    appears in both the seed's radio and the *happy* pool is a bridge between
+    where the listener is and where they are going, and it rises above the
+    generically happy tracks around it without ever outranking them on its own.
     """
     merged = {}
-    for g in groups:
+    for weight, g in groups:
         for c in g:
-            key = (common.norm(c["title"]), common.norm(c["artist"]))
-            if not key[0]:
+            k_ = common.key(c["title"], c["artist"])
+            if not k_.split("|")[0]:
                 continue
-            m = merged.setdefault(key, dict(c, rrf=0.0, sources=set(),
-                                            best_rank=c["rank"]))
-            m["rrf"] += 1.0 / (k + c["rank"])
-            m["sources"].add(c["source"])
-            m["best_rank"] = min(m["best_rank"], c["rank"])
+            m = merged.get(k_)
+            if m is None:
+                m = merged[k_] = dict(c, rrf=0.0, sources=set(), key=k_)
+            m["rrf"] += weight / (k + c["rank"])
+            m["sources"].add(c["source"].split("/")[0])
             if c.get("score") is not None:
                 m["score"] = max(m.get("score") or 0.0, c["score"])
-            for f in ("length", "album", "videoId"):   # keep whichever source has it
+            # Only the radio queue reports a release year — the curated
+            # playlists and Last.fm both omit it entirely — so whichever
+            # source happened to know it fills it in for the merged row.
+            for f in ("album", "video_id", "year"):
                 if not m.get(f) and c.get(f):
                     m[f] = c[f]
-    return sorted(merged.values(), key=lambda c: (-len(c["sources"]), -c["rrf"]))
+            if not m.get("secs") and c.get("secs"):
+                m["secs"] = c["secs"]
+    return sorted(merged.values(), key=lambda c: -c["rrf"])

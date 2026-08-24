@@ -1,105 +1,123 @@
-"""Shared plumbing: database, schema, and the one LLM call everything uses."""
+"""Shared plumbing: env, the library cache, title matching, and the LLM call.
+
+The previous version of this file carried a schema for a tagged corpus — every
+track scored for valence, energy and theme so the engine could select by mood
+coordinates. That is gone. Nothing here tags music any more.
+
+What survives is small on purpose: the database is now a *cache of your own
+library*, not a model of the world's music. Co-listening data lives at YouTube
+Music and Last.fm and is fetched fresh per request; the only thing worth
+keeping on disk is the one fact those two services cannot tell us, which is
+what you personally own.
+"""
 import json
 import os
 import re
-import sqlite3
-import sys
-import unicodedata
-import time
-
 import shutil
+import sqlite3
 import subprocess
+import sys
+import time
+import unicodedata
 
 import requests
+
 
 def _load_env():
     """Read .env beside this file so keys never land in the shell history."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if not os.path.exists(path):
         return
-    for line in open(path):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
 
 
 _load_env()
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 CLI_MODEL = os.environ.get("ELO_MODEL", "sonnet")
 API_MODEL = os.environ.get("ELO_API_MODEL", "claude-sonnet-5")
-DB = os.environ.get("ELO_DB") or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "data", "elo.db")
+DB = os.environ.get("ELO_DB") or os.path.join(HERE, "data", "elo.db")
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS tracks (
-    id       INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS library_tracks (
+    key      TEXT PRIMARY KEY,             -- norm(title)|norm(artist)
     title    TEXT NOT NULL,
     artist   TEXT NOT NULL DEFAULT '',
     album    TEXT NOT NULL DEFAULT '',
-    genre    TEXT NOT NULL DEFAULT '',
+    genre    TEXT NOT NULL DEFAULT '',     -- Apple ships one per track
     year     TEXT NOT NULL DEFAULT '',
     seconds  INTEGER NOT NULL DEFAULT 0,
-    external INTEGER NOT NULL DEFAULT 0,   -- 1 = a seed we looked up, not owned
-    UNIQUE (title, artist, album)
+    plays    INTEGER NOT NULL DEFAULT 0,   -- the strongest signal in the file
+    skips    INTEGER NOT NULL DEFAULT 0,   -- and the only negative one
+    rating   INTEGER NOT NULL DEFAULT 0,   -- 0-100, Apple's star rating x20
+    liked    INTEGER NOT NULL DEFAULT 0,
+    added    TEXT NOT NULL DEFAULT '',     -- ISO date, for recency
+    sources  TEXT NOT NULL DEFAULT '',     -- apple,spotify,ytmusic
+    video_id TEXT NOT NULL DEFAULT ''      -- known only from YouTube Music
 );
-CREATE TABLE IF NOT EXISTS lyrics (
-    track_id INTEGER PRIMARY KEY,
-    source   TEXT NOT NULL,                -- lrclib | genius | none
-    text     TEXT NOT NULL DEFAULT '',
-    chars    INTEGER NOT NULL DEFAULT 0
+CREATE TABLE IF NOT EXISTS library_artists (
+    key        TEXT PRIMARY KEY,           -- norm(name)
+    name       TEXT NOT NULL,
+    tracks     INTEGER NOT NULL DEFAULT 0, -- songs of theirs you have
+    albums     INTEGER NOT NULL DEFAULT 0,
+    playlists  INTEGER NOT NULL DEFAULT 0, -- how many of yours they appear in
+    plays      INTEGER NOT NULL DEFAULT 0,
+    liked      INTEGER NOT NULL DEFAULT 0,
+    subscribed INTEGER NOT NULL DEFAULT 0,
+    sources    TEXT NOT NULL DEFAULT ''
 );
-CREATE TABLE IF NOT EXISTS moods (
-    track_id   INTEGER PRIMARY KEY,
-    themes     TEXT NOT NULL DEFAULT '[]', -- JSON array, controlled vocabulary
-    stance     TEXT NOT NULL DEFAULT '',
-    valence    REAL,                       -- 0 desolate .. 10 elated
-    energy     REAL,                       -- 0 still .. 10 frantic
-    summary    TEXT NOT NULL DEFAULT '',
-    basis      TEXT NOT NULL DEFAULT '',   -- lyrics | metadata
-    confidence TEXT NOT NULL DEFAULT ''    -- known | guessed
+CREATE TABLE IF NOT EXISTS library_playlists (
+    id     TEXT PRIMARY KEY,               -- source-prefixed
+    name   TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    n      INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS moods_ve ON moods (valence, energy);
+CREATE TABLE IF NOT EXISTS library_playlist_tracks (
+    playlist_id TEXT NOT NULL,
+    track_key   TEXT NOT NULL,
+    pos         INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (playlist_id, track_key)
+);
+CREATE INDEX IF NOT EXISTS plt_track ON library_playlist_tracks (track_key);
+CREATE TABLE IF NOT EXISTS artist_tags (
+    key     TEXT PRIMARY KEY,              -- norm(name)
+    tags    TEXT NOT NULL DEFAULT '',      -- comma-separated, ranked
+    source  TEXT NOT NULL DEFAULT '',      -- apple | spotify | lastfm
+    fetched TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
 
-def connect(create=False):
-    """Open the corpus, creating it if this is a first run.
-
-    This used to refuse to start without an ingested library, which was the
-    library-first assumption in its purest form: a new user has no library and
-    is not going to make one. The corpus fills itself from co-listening as
-    requests come in, so an empty database is a normal starting state, not an
-    error. `create` is kept for callers that pass it and no longer gates
-    anything.
-    """
+def connect():
+    """Open the cache, creating it on first run. An empty cache is normal —
+    it means we have no affinity signal yet, not that anything is wrong."""
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     con = sqlite3.connect(DB)
     con.executescript(SCHEMA)
-    for col, decl in (("seconds", "INTEGER NOT NULL DEFAULT 0"),
-                      ("external", "INTEGER NOT NULL DEFAULT 0")):
-        cols = {r[1] for r in con.execute("PRAGMA table_info(tracks)")}
-        if col not in cols:
-            con.execute("ALTER TABLE tracks ADD COLUMN %s %s" % (col, decl))
     con.commit()
     return con
 
 
 _SUFFIX = re.compile(
     r"\b(remaster(ed)?|remix|live|deluxe|edition|version|mono|stereo|"
-    r"radio edit|extended|acoustic|instrumental|bonus track|explicit)\b")
+    r"radio edit|extended|acoustic|instrumental|bonus track|explicit|"
+    r"official (music )?video|official (lyric|audio) video|lyric video|"
+    r"visualizer|audio)\b")
 
 
 def norm(s):
     """Aggressive normalisation for cross-source title/artist matching.
 
-    Keeps every script. The old version ended with `[^a-z0-9\\s]`, which
-    deleted anything that was not Latin: Cyrillic, Arabic and CJK titles all
-    normalised to the empty string, so they collided with each other, and
-    pool.ensure_tracks — which skips rows with an empty key — could never admit
-    them to the corpus at all. Non-Western music was being dropped by the
-    matcher rather than by any source. Accents are still folded, so `Café`
-    still matches `Cafe`, but `東京` now survives as `東京`.
+    Keeps every script. Accents are folded so `Café` matches `Cafe`, but the
+    character class is Unicode-aware, so `東京` survives as `東京` rather than
+    normalising to the empty string and colliding with every other non-Latin
+    title.
     """
     s = unicodedata.normalize("NFKD", s or "").lower()
     s = re.sub(r"\(.*?\)|\[.*?\]", " ", s)          # (feat. X), [Remix]
@@ -110,6 +128,47 @@ def norm(s):
     s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)            # keep letters
     return re.sub(r"\s+", " ", s).strip()
 
+
+def key(title, artist):
+    return "%s|%s" % (norm(title), norm(artist))
+
+
+def clean(title):
+    """Strip the video-platform noise YouTube Music playlist titles carry.
+
+    Mood playlists come back with titles like `logical (Official Lyric Video)`.
+    The parenthetical is not part of the song and reading fifty of them wastes
+    the model's attention, so it goes before the prompt is built. The videoId
+    is what actually identifies the track, and that is untouched.
+    """
+    t = re.sub(r"\s*[\(\[][^\)\]]*"
+               r"(official|video|audio|visuali[sz]er|lyric|hd|4k|explicit)"
+               r"[^\)\]]*[\)\]]", "", title or "", flags=re.I)
+    return re.sub(r"\s+", " ", t).strip() or (title or "")
+
+
+def seconds(length):
+    """`"5:35"` -> 335. Sources that give no duration get 0 and the caller
+    substitutes an average; guessing here would hide the missing data."""
+    if not length:
+        return 0
+    parts = str(length).split(":")
+    try:
+        parts = [int(p) for p in parts]
+    except ValueError:
+        return 0
+    out = 0
+    for p in parts:
+        out = out * 60 + p
+    return out
+
+
+def hhmm(secs):
+    m, s = divmod(int(secs), 60)
+    return "%d:%02d" % (m, s)
+
+
+# ---------------------------------------------------------------- the model
 
 def _extract(text):
     """The CLI returns prose-free JSON when asked, but tolerate a code fence."""
@@ -130,10 +189,15 @@ def _via_cli(prompt, schema, retries=2):
     ask = (prompt + "\n\nReturn ONLY a JSON object matching this schema. No "
            "markdown fence, no commentary, no explanation before or after.\n"
            + json.dumps(schema))
+    # .env carries an ANTHROPIC_API_KEY for the `api` backend, and its mere
+    # presence makes the CLI refuse to use the claude.ai login it would
+    # otherwise prefer. Hide it from the child so choosing the CLI backend
+    # actually gets the CLI backend, and the key stays inert until asked for.
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     for attempt in range(retries):
         p = subprocess.run(
             ["claude", "-p", "--model", CLI_MODEL, "--output-format", "text"],
-            input=ask, capture_output=True, text=True, timeout=900)
+            input=ask, capture_output=True, text=True, timeout=900, env=env)
         if p.returncode != 0:
             raise RuntimeError("claude CLI failed: %s" % p.stderr.strip()[:300])
         try:
@@ -146,12 +210,55 @@ def _via_cli(prompt, schema, retries=2):
                    "Return only the raw JSON object." % e
 
 
+# Keywords the API's json_schema enforcement rejects outright, mapped to how
+# the same constraint reads as an instruction. Measured, not guessed: `enum`,
+# `minLength`, `minItems`, nested objects and optional properties all pass;
+# these three return a 400.
+_UNENFORCEABLE = {"minimum": "at least %s", "maximum": "at most %s",
+                  "maxItems": "at most %s items"}
+
+
+def _relax(schema, path="", notes=None):
+    """Strip the keywords the API refuses, restating each as prose.
+
+    Server-side enforcement is stricter than the CLI's parse-and-hope, which is
+    the reason to use it — but it supports a subset of JSON Schema, and a range
+    it will not enforce is still a constraint the model should honour. Dropping
+    the keyword silently would quietly widen every bound in the file; dropping
+    it into the prompt keeps it, just advisory instead of guaranteed.
+    """
+    notes = [] if notes is None else notes
+    if isinstance(schema, list):
+        return [_relax(s, path, notes) for s in schema], notes
+    if not isinstance(schema, dict):
+        return schema, notes
+    out = {}
+    for k, v in schema.items():
+        if k in _UNENFORCEABLE:
+            notes.append("%s: %s" % (path or "value",
+                                     _UNENFORCEABLE[k] % (v,)))
+            continue
+        if k == "properties" and isinstance(v, dict):
+            out[k] = {name: _relax(sub, "%s.%s" % (path, name) if path
+                                   else name, notes)[0]
+                      for name, sub in v.items()}
+        elif k in ("items", "additionalProperties") or isinstance(v, dict):
+            out[k] = _relax(v, path, notes)[0]
+        else:
+            out[k] = v
+    return out, notes
+
+
 def _via_api(prompt, schema, max_tokens, retries=3):
-    key = os.environ["ANTHROPIC_API_KEY"]
+    key_ = os.environ["ANTHROPIC_API_KEY"]
+    schema, notes = _relax(schema)
+    if notes:
+        prompt += ("\n\nThese bounds are not machine-enforced. Respect them "
+                   "anyway:\n  " + "\n  ".join(notes))
     for attempt in range(retries):
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+            headers={"x-api-key": key_, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
             json={"model": API_MODEL, "max_tokens": max_tokens,
                   "messages": [{"role": "user", "content": prompt}],
@@ -167,15 +274,15 @@ def _via_api(prompt, schema, max_tokens, retries=3):
         if body.get("stop_reason") == "refusal":
             sys.exit("Model declined: %s" % body.get("stop_details"))
         if body.get("stop_reason") == "max_tokens":
-            sys.exit("Hit max_tokens — lower the batch size and retry.")
+            sys.exit("Hit max_tokens — shrink the candidate list and retry.")
         return json.loads("".join(b["text"] for b in body["content"]
                                   if b["type"] == "text"))
 
 
-def llm(prompt, schema, max_tokens=16000):
+def llm(prompt, schema, max_tokens=8000):
     """Prefer the Claude Code CLI you are already logged into. ANTHROPIC_API_KEY
-    is only used if you set it deliberately — it gets schema enforcement
-    server-side, which is stricter, but it bills separately."""
+    is only used if you set ELO_BACKEND=api deliberately — it gets schema
+    enforcement server-side, which is stricter, but it bills separately."""
     if os.environ.get("ELO_BACKEND") == "api" and os.environ.get(
             "ANTHROPIC_API_KEY"):
         return _via_api(prompt, schema, max_tokens)

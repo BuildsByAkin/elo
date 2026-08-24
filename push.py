@@ -20,41 +20,11 @@ import sys
 
 import common
 
-AUTH_FILES = ("browser.json", "oauth.json")
-
-
-def _auth_path():
-    here = os.path.dirname(os.path.abspath(__file__))
-    for name in AUTH_FILES:
-        for base in (os.getcwd(), here):
-            p = os.path.join(base, name)
-            if os.path.exists(p):
-                return p
-    return None
-
-
 def client(need_auth=True):
-    try:
-        from ytmusicapi import YTMusic
-    except ImportError:
-        sys.exit("ytmusicapi is not installed — pip install ytmusicapi")
-    if not need_auth:
-        return YTMusic()
-    path = _auth_path()
-    if not path:
-        sys.exit(
-            "No YouTube Music credentials found.\n\n"
-            "Set them up once (about two minutes):\n"
-            "  1. open https://music.youtube.com in your browser, logged in\n"
-            "  2. open developer tools, Network tab\n"
-            "  3. filter for  /browse  and click an authenticated POST (status 200)\n"
-            "  4. copy the request headers\n"
-            "       Firefox: right-click > Copy > Copy Request Headers\n"
-            "       Chrome:  right-click > Copy > Copy as fetch (Node.js)\n"
-            "  5. run:  ytmusicapi browser\n"
-            "     paste the headers, then press Ctrl-D\n\n"
-            "That writes browser.json here and lasts about two years.")
-    return YTMusic(path)
+    """Credentials and their health live in ytauth — see the note there about
+    why an expired session looks exactly like an empty account."""
+    import ytauth
+    return ytauth.client(need_auth)
 
 
 def _hit(want_t, want_a, got_t, got_a):
@@ -68,10 +38,16 @@ def _hit(want_t, want_a, got_t, got_a):
 
 
 def resolve(yt, tracks, quiet=False):
-    """Find a videoId for each track. Returns (ids, misses)."""
+    """Find a videoId for each track. Returns (ids, misses).
+
+    Most tracks already carry one: YouTube Music radio queues and mood
+    playlists hand back the videoId with the track, and so does your cached
+    library. Only Last.fm-only candidates need a search here, which is both
+    faster and safer — a search is the step where the wrong song gets in.
+    """
     ids, misses = [], []
     for t in tracks:
-        vid = t.get("videoId") or ""
+        vid = t.get("video_id") or t.get("videoId") or ""
         if not vid:
             try:
                 res = yt.search("%s %s" % (t["title"], t["artist"]),
@@ -99,6 +75,8 @@ def resolve(yt, tracks, quiet=False):
 
 def create(tracks, title, description="", quiet=False):
     """Create the playlist. Returns its id, or None if nothing resolved."""
+    import ytauth
+    ytauth.require("pushing a playlist")
     yt = client()
     print("resolving %d tracks against the YouTube Music catalogue..."
           % len(tracks), file=sys.stderr)

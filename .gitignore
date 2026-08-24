@@ -8,3 +8,4 @@ data/*.backup
 browser.json
 oauth.json
 *.json.bak
+spotify.json
