@@ -21,6 +21,10 @@ code, and only then asks a model to order the shortlist.
 
 Subcommands:
     elo.py "<request>"            build a playlist  (default)
+    elo.py no 3 5 / yes 1         that one was wrong / that one was right
+    elo.py again                  rebuild the last request with that applied
+    elo.py last                   the last playlist, numbered
+    elo.py feedback / forget      what has been learned, and undoing it
     elo.py auth                   which services are connected
     elo.py auth ytmusic [file]    paste your YouTube Music headers
     elo.py import apple <file>    Music.app > File > Library > Export Library
@@ -95,6 +99,61 @@ Spotify authorises itself on `elo.py import spotify`; Apple needs no
 credentials at all."""
 
 
+FEEDBACK_HELP = """usage:
+  elo.py no 3 5        drop tracks 3 and 5 of the last playlist
+  elo.py no 2-4        a range
+  elo.py no "sicko"    match on title or artist instead
+  elo.py yes 1         the opposite: you want more like this
+  elo.py again         rebuild the same request with that applied
+  elo.py last          the last playlist, numbered
+  elo.py feedback      everything learned so far
+  elo.py forget [x]    undo one track's verdicts, or all of them
+
+A rejection is scoped to the block it happened in — dropping a rap track from
+a sleep block teaches "not here", not "never". Reject the same track in two
+different blocks and it is dropped everywhere."""
+
+
+def cmd_verdict(args, verdict):
+    import feedback
+    if not args:
+        sys.exit(FEEDBACK_HELP)
+    feedback.record(args, verdict)
+    print("  run `elo.py again` to rebuild with that applied",
+          file=sys.stderr)
+
+
+def cmd_last():
+    import feedback
+    rows = feedback.last()
+    if not rows:
+        sys.exit("no playlist yet — build one first")
+    print("%s\n" % rows[0]["request"], file=sys.stderr)
+    for r in rows:
+        print("  %2d  %-42s %-24s %s"
+              % (r["pos"], r["title"][:42], r["artist"][:24], r["mood"]))
+
+
+def cmd_feedback():
+    import feedback
+    feedback.show(feedback.summary())
+
+
+def cmd_forget(args):
+    import feedback
+    n = feedback.forget(args[0] if args else None)
+    print("forgot %d verdict%s" % (n, "" if n == 1 else "s"), file=sys.stderr)
+
+
+def cmd_again(argv):
+    """Rebuild the last request. The point of the loop, made visible."""
+    import feedback
+    rows = feedback.last()
+    if not rows or not rows[0]["request"]:
+        sys.exit("nothing to rebuild — ask for a playlist first")
+    return rows[0]["request"]
+
+
 def cmd_auth(args):
     import ytauth
     if args and args[0] in ("-h", "--help", "help"):
@@ -145,8 +204,13 @@ def cmd_build(args):
     if not tracks:
         sys.exit("nothing came back — try naming a song or a genre")
 
-    blend.show(blocks)
+    blend.show(blocks, taste=taste)
     print("built in %.1fs" % (time.time() - started), file=sys.stderr)
+
+    import feedback
+    feedback.remember(blocks, args.request)
+    print("  not right?  elo.py no 3 5   ·   keep one?  elo.py yes 1   ·   "
+          "then  elo.py again", file=sys.stderr)
 
     if args.json:
         out = []
@@ -172,6 +236,20 @@ def main():
         return cmd_import(argv[1:])
     if argv and argv[0] in ("taste", "library"):
         return cmd_taste()
+    if argv and argv[0] in ("no", "drop"):
+        return cmd_verdict(argv[1:], -1)
+    if argv and argv[0] in ("yes", "keep", "more"):
+        return cmd_verdict(argv[1:], +1)
+    if argv and argv[0] == "last":
+        return cmd_last()
+    if argv and argv[0] == "feedback":
+        return cmd_feedback()
+    if argv and argv[0] == "forget":
+        return cmd_forget(argv[1:])
+    if argv and argv[0] == "again":
+        # Replace the subcommand with the request it stands for and fall
+        # through, so `again` accepts every flag a fresh build does.
+        argv = [cmd_again(argv)] + argv[1:]
 
     p = argparse.ArgumentParser(
         prog="elo", description=__doc__.split("\n\n")[0],

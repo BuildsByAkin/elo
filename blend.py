@@ -36,6 +36,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import common
+import feedback as F
 import sources
 import taste as T
 
@@ -325,9 +326,11 @@ def trim(picked, minutes, carry=0):
 # ------------------------------------------------------------------- stitch
 
 def build(plan, taste=None, use_llm=True, wide=2,
-          max_per_artist=MAX_PER_ARTIST, max_owned=MAX_OWNED, quiet=False):
+          max_per_artist=MAX_PER_ARTIST, max_owned=MAX_OWNED, learned=None,
+          quiet=False):
     """Run the whole pipeline. Returns `(tracks, blocks)`."""
     taste = T.load() if taste is None else taste
+    learned = F.load() if learned is None else learned
     segs = plan["segments"]
     per_seg = gather(plan, taste, wide=wide, quiet=quiet)
 
@@ -351,6 +354,15 @@ def build(plan, taste=None, use_llm=True, wide=2,
                                  yours)] if yours else [])
         cands = sources.fuse(groups)
         T.boost(cands, taste, seg, chosen)
+        # After the inferred weights, never before: what you said outright
+        # overrules what we guessed, and it is the only thing here allowed to
+        # remove a candidate rather than demote it.
+        vetoed = F.apply(cands, learned, seg)
+        if vetoed and not quiet:
+            print("  dropped %d you rejected before: %s"
+                  % (len(vetoed), ", ".join(c["title"][:24]
+                                            for c in vetoed[:4])),
+                  file=sys.stderr)
 
         # Deduplicate against everything already chosen, cap how often one
         # artist can come back, and cap how much of the block can be music you
@@ -409,22 +421,24 @@ def build(plan, taste=None, use_llm=True, wide=2,
     return tracks, blocks
 
 
-def show(blocks, out=sys.stdout):
-    total = 0
+def show(blocks, out=sys.stdout, taste=None):
+    """Numbered, because the numbers are what `elo.py no 3 5` points at."""
+    total, pos = 0, 0
     for b in blocks:
         s = b["segment"]
         print("\n%s  (%s, %s)" % (s["label"], s["mood"],
                                   common.hhmm(b["seconds"])), file=out)
         for c in b["tracks"]:
-            print("  %s %-42s %-24s %5s  %-20s %s"
-                  % ("*" if c.get("aff") else " ", c["title"][:42],
-                     c["artist"][:24],
+            pos += 1
+            owned = taste and c.get("key") in taste.tracks
+            print("  %2d %s %-40s %-23s %5s  %-18s %s"
+                  % (pos, "*" if owned else " ", c["title"][:40],
+                     c["artist"][:23],
                      common.hhmm(c["secs"]) if c["secs"] else "-",
-                     ",".join(sorted(s.split(":")[0]
-                                     for s in c["sources"]))[:20],
+                     ",".join(sorted(x.split(":")[0]
+                                     for x in c["sources"]))[:18],
                      c.get("why") or c.get("aff") or ""), file=out)
         total += b["seconds"]
-    n = sum(len(b["tracks"]) for b in blocks)
     asked = sum(b["segment"]["minutes"] for b in blocks) * 60
     print("\n%d tracks, %s  (asked for %s)"
-          % (n, common.hhmm(total), common.hhmm(asked)), file=out)
+          % (pos, common.hhmm(total), common.hhmm(asked)), file=out)

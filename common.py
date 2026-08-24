@@ -90,6 +90,28 @@ CREATE TABLE IF NOT EXISTS artist_tags (
     source  TEXT NOT NULL DEFAULT '',      -- apple | spotify | lastfm
     fetched TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS feedback (
+    id        INTEGER PRIMARY KEY,
+    track_key TEXT NOT NULL,
+    title     TEXT NOT NULL DEFAULT '',
+    artist    TEXT NOT NULL DEFAULT '',
+    verdict   INTEGER NOT NULL,          -- -1 rejected, +1 kept
+    mood      TEXT NOT NULL DEFAULT '',  -- the block it appeared in
+    tags      TEXT NOT NULL DEFAULT '',
+    request   TEXT NOT NULL DEFAULT '',  -- what was asked for, for provenance
+    at        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS feedback_track ON feedback (track_key);
+CREATE TABLE IF NOT EXISTS last_playlist (
+    pos       INTEGER PRIMARY KEY,       -- the number printed next to it
+    track_key TEXT NOT NULL,
+    title     TEXT NOT NULL DEFAULT '',
+    artist    TEXT NOT NULL DEFAULT '',
+    mood      TEXT NOT NULL DEFAULT '',
+    tags      TEXT NOT NULL DEFAULT '',
+    request   TEXT NOT NULL DEFAULT '',
+    at        TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 

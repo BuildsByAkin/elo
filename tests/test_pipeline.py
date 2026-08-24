@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import blend            # noqa: E402
 import common           # noqa: E402
+import feedback as F    # noqa: E402
 import library          # noqa: E402
 import sources          # noqa: E402
 import taste as T       # noqa: E402
@@ -484,6 +485,152 @@ class TestEra(unittest.TestCase):
             (1.0, [sources._cand("Song", "X", 2, "radio", year="2015")])])
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["year"], "2015")
+
+
+class TestFeedback(unittest.TestCase):
+    """The one channel where the listener says it outright, so the only one
+    allowed to remove a candidate instead of demoting it."""
+
+    def setUp(self):
+        con = common.connect()
+        con.execute("DELETE FROM feedback")
+        con.execute("DELETE FROM last_playlist")
+        con.commit()
+        self.blocks = [
+            {"segment": {"mood": "Hip-hop", "tags": ["trap"],
+                         "label": "bangers", "minutes": 10},
+             "tracks": [{"title": "Alpha", "artist": "Rap Guy",
+                         "key": common.key("Alpha", "Rap Guy")},
+                        {"title": "Beta", "artist": "Rap Guy",
+                         "key": common.key("Beta", "Rap Guy")}],
+             "seconds": 400},
+            {"segment": {"mood": "Sleep", "tags": [], "label": "down",
+                         "minutes": 10},
+             "tracks": [{"title": "Gamma", "artist": "Quiet One",
+                         "key": common.key("Gamma", "Quiet One")}],
+             "seconds": 300}]
+        F.remember(self.blocks, "bangers then sleep")
+
+    def test_remember_numbers_across_blocks(self):
+        rows = F.last()
+        self.assertEqual([r["pos"] for r in rows], [1, 2, 3])
+        self.assertEqual(rows[2]["title"], "Gamma")
+        self.assertEqual(rows[2]["mood"], "Sleep",
+                         "a verdict must know which block it happened in")
+        self.assertEqual(rows[0]["request"], "bangers then sleep")
+
+    def test_resolve_accepts_positions_ranges_and_names(self):
+        rows = F.last()
+        self.assertEqual([r["pos"] for r in F._resolve(rows, ["2"])], [2])
+        self.assertEqual([r["pos"] for r in F._resolve(rows, ["1-3"])],
+                         [1, 2, 3])
+        self.assertEqual([r["pos"] for r in F._resolve(rows, ["all"])],
+                         [1, 2, 3])
+        self.assertEqual([r["pos"] for r in F._resolve(rows, ["gamma"])], [3])
+        self.assertEqual([r["pos"] for r in F._resolve(rows, ["Rap Guy"])],
+                         [1, 2])
+        self.assertEqual([r["pos"] for r in F._resolve(rows, ["2", "2"])], [2])
+
+    def test_resolve_refuses_rather_than_guessing(self):
+        with self.assertRaises(SystemExit):
+            F._resolve(F.last(), ["99"])
+        with self.assertRaises(SystemExit):
+            F._resolve(F.last(), ["nothing like this"])
+
+    def test_a_rejection_is_scoped_to_the_block_it_happened_in(self):
+        """Dropping a rap track from a sleep block must not delete it from
+        your life."""
+        F.record(["1"], -1, quiet=True)
+        L = F.load()
+        k = common.key("Alpha", "Rap Guy")
+        self.assertTrue(L.vetoed(k, "Hip-hop"))
+        self.assertIsNone(L.vetoed(k, "Sleep"))
+        self.assertIsNone(L.vetoed(k, "Party"))
+
+    def test_but_it_still_counts_against_it_elsewhere(self):
+        F.record(["1"], -1, quiet=True)
+        w, why = F.load().weight(common.key("Alpha", "Rap Guy"), "Rap Guy",
+                                 "Sleep")
+        self.assertLess(w, 1.0)
+        self.assertIn("elsewhere", why)
+
+    def test_rejecting_in_two_unrelated_blocks_widens_the_veto(self):
+        F.record(["1"], -1, quiet=True)
+        F.remember([{"segment": {"mood": "Sleep", "tags": []},
+                     "tracks": [{"title": "Alpha", "artist": "Rap Guy",
+                                 "key": common.key("Alpha", "Rap Guy")}],
+                     "seconds": 200}], "quiet please")
+        F.record(["1"], -1, quiet=True)
+        L = F.load()
+        k = common.key("Alpha", "Rap Guy")
+        for mood in ("Hip-hop", "Sleep", "Party", "Workout"):
+            self.assertTrue(L.vetoed(k, mood), mood)
+
+    def test_keeping_is_the_mirror_of_rejecting(self):
+        F.record(["1"], +1, quiet=True)
+        L = F.load()
+        k = common.key("Alpha", "Rap Guy")
+        self.assertIsNone(L.vetoed(k, "Hip-hop"))
+        here, _ = L.weight(k, "Rap Guy", "Hip-hop")
+        away, _ = L.weight(k, "Rap Guy", "Sleep")
+        self.assertGreater(here, away)
+        self.assertGreater(away, 1.0)
+
+    def test_one_rejection_does_not_condemn_an_artist(self):
+        """The system must not flinch at noise and narrow itself to nothing."""
+        F.record(["1"], -1, quiet=True)
+        w, why = F.load().weight("some|other", "Rap Guy", "Hip-hop")
+        self.assertEqual(w, 1.0)
+        self.assertEqual(why, "")
+
+    def test_a_pattern_does(self):
+        L = F.Learned({}, {common.norm("Rap Guy"): {"Hip-hop": (3, 1)}})
+        w, why = L.weight("some|other", "Rap Guy", "Hip-hop")
+        self.assertLess(w, 0.7)
+        self.assertIn("3 of 4", why)
+        # ...and only in the block the pattern was in.
+        self.assertEqual(L.weight("some|other", "Rap Guy", "Party")[0], 1.0)
+
+    def test_apply_removes_vetoed_and_reweighs_the_rest(self):
+        F.record(["1"], -1, quiet=True)
+        F.record(["2"], +1, quiet=True)
+        cands = sources.fuse([(1.0, [
+            cand("Alpha", "Rap Guy", 1, "mood"),
+            cand("Beta", "Rap Guy", 2, "mood"),
+            cand("Delta", "Nobody", 3, "mood")])])
+        for c in cands:
+            c["rank_score"] = c["rrf"]
+        dropped = F.apply(cands, F.load(), {"mood": "Hip-hop"})
+        self.assertEqual([c["title"] for c in dropped], ["Alpha"])
+        self.assertEqual(sorted(c["title"] for c in cands),
+                         ["Beta", "Delta"])
+        self.assertEqual(cands[0]["title"], "Beta",
+                         "the kept track should now outrank the stranger")
+        self.assertIn("kept", cands[0]["aff"])
+
+    def test_apply_is_a_no_op_with_nothing_learned(self):
+        cands = sources.fuse([(1.0, [cand("A", "X", 1, "mood"),
+                                     cand("B", "Y", 2, "mood")])])
+        before = [c["title"] for c in cands]
+        self.assertEqual(F.apply(cands, F.load(), {"mood": "Hip-hop"}), [])
+        self.assertEqual([c["title"] for c in cands], before)
+
+    def test_forget_one_and_forget_all(self):
+        F.record(["1", "2"], -1, quiet=True)
+        self.assertEqual(F.forget("Alpha"), 1)
+        self.assertIsNone(F.load().vetoed(common.key("Alpha", "Rap Guy"),
+                                          "Hip-hop"))
+        self.assertTrue(F.load().vetoed(common.key("Beta", "Rap Guy"),
+                                        "Hip-hop"))
+        self.assertEqual(F.forget("all"), 1)
+        self.assertFalse(F.load())
+
+    def test_summary_reports_nothing_when_there_is_nothing(self):
+        self.assertIsNone(F.summary())
+        F.record(["1"], -1, quiet=True)
+        s = F.summary()
+        self.assertEqual(len(s["drops"]), 1)
+        self.assertEqual(len(s["keeps"]), 0)
 
 
 class TestYouTubeMusicAuth(unittest.TestCase):

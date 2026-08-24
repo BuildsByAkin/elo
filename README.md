@@ -238,6 +238,67 @@ With nothing imported every multiplier is 1.0 and no library candidates are
 injected, which degrades the tool to "well-recommended music by strangers"
 rather than breaking it.
 
+## Saying "not that one"
+
+Playlists come out numbered, and the numbers are the handle:
+
+```
+$ elo.py "hip hop bangers, 20 minutes"
+   1 * HUMBLE.        Kendrick Lamar   2:57   instant hard-hitting opener
+   2 * Going Bad      Meek Mill        4:47   trap bounce, raises heat
+   3   DNA.           Kendrick Lamar   3:06   aggressive Kendrick bars
+   4 * 0 to 100       Drake            4:57   Drake flex, keeps tempo up
+   5 * R.I.C.O.       Meek Mill        4:54   hardcore trap grit
+
+$ elo.py no 2 4        # or  no 2-4  ·  no "sicko"  ·  yes 1
+$ elo.py again
+  dropped 2 you rejected before: Going Bad, 0 to 100
+```
+
+This is the only channel where you state a preference outright rather than
+having it inferred, so it is the only one allowed to **remove** a candidate
+instead of demoting it. A boost that politely lowers a song you explicitly
+rejected is not a rejection, and a listener who has to say "not that one"
+three times has been ignored twice.
+
+### Scoped to the block, not the world
+
+Rejecting a rap track in a *sleep* block does not mean "never play this" — it
+means "not here". Ban it outright and one impatient tap in the wrong block
+quietly deletes a song from your library forever, and you never find out why
+it stopped appearing. So every verdict is filed against the block it happened
+in:
+
+| | in the block you rejected it | in any other block |
+|---|---|---|
+| rejected once | **removed** | ×0.4 |
+| rejected in two different blocks | **removed** | **removed** |
+| kept | ×1.6 | ×1.2 |
+
+The widening is automatic and it is the listener's own doing: twice, in
+unrelated contexts, is you telling us about the song rather than about the
+block.
+
+### Generalising without flinching
+
+Track vetoes are precise and do not travel. Artists are where the useful
+generalisation lives — three rejections out of four appearances says something
+about that artist *in that mood*, and is worth applying to their tracks you
+have never been shown. One rejection says nothing. So the artist term needs at
+least three appearances before it does anything at all; the alternative is a
+system that overreacts to noise and slowly narrows itself to a handful of
+songs.
+
+```
+1 dropped / 3 kept  ->  x0.85
+2 dropped / 2 kept  ->  x0.70
+3 dropped / 1 kept  ->  x0.55
+4 dropped / 0 kept  ->  x0.40
+```
+
+`elo.py feedback` shows everything learned; `elo.py forget "sicko"` or
+`elo.py forget all` undoes it.
+
 ## Setup
 
 ```
@@ -309,6 +370,12 @@ elo.py "<request>"           build a playlist
        --dry-run             print the plan and stop
        --json                also dump machine-readable output
 
+elo.py no 3 5 | no 2-4 | no "sicko"      that one was wrong
+elo.py yes 1                             that one was right
+elo.py again                 rebuild the last request with feedback applied
+elo.py last                  the last playlist, numbered
+elo.py feedback              everything learned so far
+elo.py forget [x]            undo one track's verdicts, or all of them
 elo.py auth                  which services are connected
 elo.py auth ytmusic [file]   paste your YouTube Music headers
 elo.py import apple <file>   Music.app > File > Library > Export Library
@@ -332,6 +399,7 @@ spotify.py   the Spotify API    -> your library      (0 calls)
 ytauth.py    YouTube Music credentials, and knowing when they have died
 library.py   the store all three import into, and the merge rules
 taste.py     your library -> candidates and weights  (0 calls)
+feedback.py  "not that one", scoped to the block it was said in
 blend.py     gather, weigh, order, stitch            (1 call per segment)
 push.py      write the playlist to YouTube Music
 common.py    env, cache, title matching, the model call
